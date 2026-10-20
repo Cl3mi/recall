@@ -18,7 +18,16 @@ from __future__ import annotations
 import math
 import re
 
-from insight import concentration, dimensions, formats, lifecycle, release, timeline
+from insight import (
+    concentration,
+    cube,
+    dimensions,
+    formats,
+    lifecycle,
+    quality,
+    release,
+    timeline,
+)
 from insight.texts import IDENTIFIER_KINDS
 from profiler import safety
 from profiler.stats import lengths
@@ -28,24 +37,32 @@ KEYS = frozenset(
     {
         "any_share",
         "any_share_after_cleaning",
+        "axes",
+        "baug",
         "baugruppe",
         "baugruppe_model_year",
         "below_floor",
         "bigrams",
         "bigrams_omitted",
         "bigrams_withheld",
+        "blank",
         "blank_problem_text",
         "bucket",
         "buckets",
         "buckets_withheld",
         "by_category",
         "by_category_withheld",
+        "by_dimension",
+        "by_field",
         "by_kind",
+        "by_lifecycle",
         "by_year",
         "by_year_omitted",
         "by_year_withheld",
         "bytes",
+        "cat",
         "cells",
+        "checked",
         "cluster_count",
         "code_commit",
         "codes_per_ticket_quantiles",
@@ -54,8 +71,11 @@ KEYS = frozenset(
         "count",
         "coverage",
         "covered_share",
+        "cube",
+        "cuts",
         "days_since_delivery",
         "days_to_status_change_quantiles",
+        "default_min_words",
         "delivery",
         "description",
         "description_fill",
@@ -66,12 +86,14 @@ KEYS = frozenset(
         "empty",
         "enabled",
         "entity_like",
+        "fields",
         "filename",
         "fill",
         "fill_by_year",
         "fill_by_year_withheld",
         "formats",
         "gap_days_quantiles",
+        "gates",
         "gini",
         "hours",
         "identifiers",
@@ -83,7 +105,9 @@ KEYS = frozenset(
         "length_quantiles",
         "lengths",
         "lifecycle",
+        "measurement",
         "min_frequency",
+        "min_words",
         "model",
         "model_id",
         "models",
@@ -91,8 +115,14 @@ KEYS = frozenset(
         "month",
         "multi_code_share",
         "multi_share",
+        "near_duplicate",
         "negative_share",
+        "newly_derivable",
+        "no_solution",
+        "noise",
+        "noise_reasons",
         "origin",
+        "overall",
         "pairs",
         "pairs_omitted",
         "pairs_skipped",
@@ -104,6 +134,7 @@ KEYS = frozenset(
         "per_month_withheld",
         "per_year",
         "per_year_withheld",
+        "phrases",
         "prefix",
         "prefixes",
         "present",
@@ -112,6 +143,7 @@ KEYS = frozenset(
         "problem_text_length_median",
         "problem_text_length_p95",
         "provenance",
+        "quality",
         "quantiles",
         "readiness",
         "reason",
@@ -122,6 +154,7 @@ KEYS = frozenset(
         "repeat_within_90_share",
         "repetition",
         "resolution",
+        "retrievable",
         "row_count",
         "rows",
         "schema_version",
@@ -149,6 +182,7 @@ KEYS = frozenset(
         "state",
         "states",
         "states_withheld",
+        "stopped",
         "suppression",
         "templated",
         "text",
@@ -190,6 +224,7 @@ KEYS = frozenset(
         "vocabulary",
         "warranty",
         "withheld",
+        "withheld_cells",
         "year",
     }
 )
@@ -239,6 +274,15 @@ SECTIONS = (
     "vocabulary.by_category_withheld",
     "vocabulary.by_category.title_tokens_withheld",
     "vocabulary.by_category.solution_tokens_withheld",
+    "quality.by_year_withheld",
+    *(
+        f"quality.by_dimension.{dimension}.{block}"
+        for dimension in quality.DIMENSIONS
+        for block in ("withheld", "by_year_withheld")
+    ),
+    *(f"quality.by_lifecycle.{series}.buckets_withheld" for series in lifecycle.BUCKETS),
+    "quality.by_lifecycle.warranty.states_withheld",
+    "quality.cube.cuts.withheld",
 )
 
 # Where each released field may stand: the path of the entry list that carries it, matched in
@@ -265,6 +309,12 @@ RELEASED_AT = {
     "vocabulary.by_category": {"value"},
     "vocabulary.by_category.title_tokens": {"token"},
     "vocabulary.by_category.solution_tokens": {"token"},
+    **{
+        f"quality.by_dimension.{dimension}.{entries}": {"value"}
+        for dimension in quality.DIMENSIONS
+        for entries in ("values", "by_year")
+    },
+    "quality.cube.cuts.cells": {"cat", "baug", "model"},
 }
 
 _KIND = re.compile("|".join(IDENTIFIER_KINDS))
@@ -286,6 +336,8 @@ YEARS = frozenset(
         "timeline.per_year.year",
         "timeline.fill_by_year.year",
         *(f"dimensions.{column}.by_year.year" for column in dimensions.COLUMNS),
+        "quality.by_year.year",
+        *(f"quality.by_dimension.{dimension}.by_year.year" for dimension in quality.DIMENSIONS),
     }
 )
 
@@ -315,7 +367,16 @@ LITERALS = {
         for series, buckets in lifecycle.BUCKETS.items()
     },
     "lifecycle.warranty.states.state": _labels(lifecycle.STATES),
+    **{
+        f"quality.by_lifecycle.{series}.buckets.bucket": _labels(buckets)
+        for series, buckets in lifecycle.BUCKETS.items()
+    },
+    "quality.by_lifecycle.warranty.states.state": _labels(lifecycle.STATES),
     "timeline.per_month.month": timeline.MONTH,
+    "quality.cube.gates": re.compile(re.escape(cube.GATE_ORDER)),
+    "quality.cube.cuts.axes": _labels(cube.CUT_NAMES),
+    "quality.cube.cuts.cells.gates": re.compile(f"[01]{{{len(cube.GATES)}}}"),
+    "quality.cube.measurement.stopped": re.compile("budget|solver"),
 }
 
 # What a finished report may hold. A tuple, a set, bytes or any object is refused: json.dumps
@@ -385,11 +446,68 @@ def _scan(node: object, path: str, k: int, found: _Found) -> None:
             _scan(value, child, k, found)
 
 
+def _dicts_at(node: object, target: str, path: str = "") -> list[dict]:
+    """Every dict that `_scan` would visit at `target`, whatever shape carries it there. `_scan`
+    builds a path from dict keys only, so a list (or a list of lists) adds nothing to it; a check
+    that walked only the builder's own shape would miss a reshaped report that `_scan` still
+    reaches at the same path (review finding on b07bf50)."""
+    if isinstance(node, list):
+        return [d for item in node for d in _dicts_at(item, target, path)]
+    if not isinstance(node, dict):
+        return []
+    if path == target:
+        return [node]
+    found = []
+    for key, value in node.items():
+        if not isinstance(key, str):
+            continue
+        child = f"{path}.{key}" if path else key
+        if target == child or target.startswith(child + "."):
+            found.extend(_dicts_at(value, target, child))
+    return found
+
+
+def _cube_found(report: dict, k: int) -> _Found:
+    """A cube cell names only values listed in `quality.by_dimension` (or a sentinel), and exactly
+    the axes of its cut. The floor and the sweep are `_scan`'s. This keeps the report consistent
+    with itself: a value must stand, floored and swept, in the quality section's own lists."""
+    allowed = {
+        axis: {
+            e["value"]
+            for e in _dicts_at(report, f"quality.by_dimension.{source}.values")
+            if isinstance(e.get("value"), str)
+        }
+        | set(cube.SENTINELS)
+        for axis, source in cube.SOURCES.items()
+    }
+    found: _Found = []
+    path = "quality.cube.cuts.cells"
+    for cell in _dicts_at(report, path):
+        # A cell of the gates-only cut has no released field, so `_scan` does not floor it.
+        if not any(isinstance(cell.get(f), str) for f in release.RELEASED_FIELDS):
+            count = cell.get("count")
+            if not isinstance(count, int) or isinstance(count, bool):
+                found.append((path, "MISSING_COUNT", "gates"))
+            elif count < k:
+                found.append((path, "BELOW_FLOOR", "gates"))
+        for axis, values in allowed.items():
+            if isinstance(cell.get(axis), str) and cell[axis] not in values:
+                found.append((path, "UNRELEASED_VALUE", cell[axis]))
+    for cut in _dicts_at(report, "quality.cube.cuts"):
+        named = set(cut["axes"].split("+")) if isinstance(cut.get("axes"), str) else set()
+        for cell in _dicts_at(cut.get("cells"), ""):
+            carried = [axis for axis in cube.AXES if axis in cell]
+            if set(carried) != named:
+                found.append((path, "CUT_MISMATCH", "+".join(carried)))
+    return found
+
+
 def _found(report: object, k: int) -> _Found:
     if not isinstance(report, dict):
         return [("<root>", "UNACCOUNTED_TYPE", type(report).__name__)]
     found: _Found = []
     _scan(report, "", k, found)
+    found.extend(_cube_found(report, k))
     return sorted(found, key=lambda item: (item[0], item[1]))
 
 

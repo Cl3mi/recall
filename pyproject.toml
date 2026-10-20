@@ -9,6 +9,7 @@ dependencies = [
   "pydantic-settings>=2.6",
   "httpx>=0.28",
   "numpy>=2.1",
+  "scipy>=1.18",
   "jsonschema>=4.23",
   "datasketch>=1.6",
   "selectolax>=0.3",

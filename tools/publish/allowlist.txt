@@ -1,0 +1,18 @@
+# Paths that may leave the machine, as a snapshot of HEAD (git archive), never as history.
+# Everything not listed here stays local. Add a path only after it has been scrubbed of the
+# client name, real-corpus figures, host aliases and absolute paths (see tools/publish/publish.sh).
+src
+tools
+tests/__init__.py
+tests/conftest.py
+tests/guard
+fixtures
+profiler
+insight
+.githooks
+Makefile
+pyproject.toml
+uv.lock
+README.md
+CLAUDE.md
+.gitignore

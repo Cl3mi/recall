@@ -112,6 +112,9 @@ _SWEEPS = {
     "model": _code_flagged,
     "prefix": _prefix_flagged,
     "shape": _shape_flagged,
+    # The joint quality cube's category and Baugruppe axes (insight.cube): ids, swept as codes.
+    "cat": _code_flagged,
+    "baug": _code_flagged,
 }
 
 RELEASED_FIELDS = frozenset(_SWEEPS)

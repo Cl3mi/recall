@@ -20,7 +20,7 @@ import os
 import pathlib
 import sys
 
-from insight import extract, guard, release, report
+from insight import cube, extract, guard, release, report
 from profiler import safety
 from profiler.columns import EXPECTED_COLUMNS
 from profiler.stats import vocab
@@ -83,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
     # Off unless asked: vehicleSerialNo is on profiler.selfcheck.DENYLISTED_COLUMNS, and
     # releasing even a prefix is a loosening only the operator may choose.
     parser.add_argument("--serial-prefixes", action="store_true")
+    # Seconds the cube's derivability measurement may spend after setup; it never stops the run,
+    # and the report says how many cells it settled. 0 skips it; inf lets it run to the end.
+    parser.add_argument("--cube-budget", type=float, default=cube.BUDGET)
     parser.add_argument("--code-commit", default="unknown")
     parser.add_argument("--image-digest", default="unknown")
     try:
@@ -100,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     # selfcheck.passed. Whatever happens next, no output exists until a guarded one is written.
     args.out.unlink(missing_ok=True)
 
+    if not args.cube_budget >= 0:
+        return _abort("BAD_ARGUMENT", "--cube-budget must be a number of seconds, 0 or more")
     if args.min_frequency < vocab.MIN_FREQUENCY_FLOOR:
         return _abort(
             "BAD_ARGUMENT",
@@ -157,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         provenance={"code_commit": args.code_commit, "image_digest": args.image_digest},
         k=args.min_frequency,
         serial_prefixes=args.serial_prefixes,
+        cube_budget=args.cube_budget,
     )
 
     # Written under a temporary name and moved into place, so a kill or a full disk can leave
@@ -175,6 +181,12 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"rows={source['row_count']} columns_expected_missing={missing} "
         f"selfcheck_passed={built['selfcheck']['passed']} ledger_rows={len(built['suppression'])}"
+    )
+    measured = built["quality"]["cube"]["measurement"]
+    print(
+        f"cube_newly_derivable={measured['newly_derivable']} "
+        f"cube_checked={measured['checked']}/{measured['withheld_cells']}"
+        + (f" cube_stopped={measured['stopped']}" if measured["stopped"] else "")
     )
     return 0
 

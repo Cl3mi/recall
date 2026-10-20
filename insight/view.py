@@ -21,6 +21,10 @@ _CSP = (
     "img-src 'none'; connect-src 'none'; form-action 'none'"
 )
 
+# The corpus model (what survives a chain of filter steps) lives in its own file so it can be read,
+# tested and changed on its own; render() inlines it, so the page stays one offline file.
+_MODEL = (Path(__file__).with_name("view_model.js")).read_text(encoding="utf-8").rstrip("\n")
+
 _PAGE = r"""<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
@@ -359,6 +363,7 @@ tr.dim{opacity:.38}
 .tri button[aria-pressed=true].ign,.ttri button[aria-pressed=true].ign{background:var(--ink);color:var(--surf);font-weight:650}
 .pactive2{margin-top:10px;max-height:150px;overflow:auto}
 .pactive2 .plab{font-size:13px;color:var(--mute);margin-bottom:4px}
+.guess{text-decoration:underline dotted;text-underline-offset:3px;cursor:help}
 .arow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:5px 0;border-top:1px solid var(--line)}
 .asub{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .pinc3{grid-template-columns:1fr 1fr 100px}
@@ -521,248 +526,7 @@ const TOTAL = N("source.row_count") || 0;
 const niceMax = v => { const p = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1e-9)))); const m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
 const topRound = (x, y, w, h, r) => { r = Math.min(r, h, w / 2); return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`; };
 
-/* ---------- filter model: what survives a chain of steps (MODEL-BEGIN) ---------- */
-/* The report holds aggregates, not tickets. A chain of steps is answered as exact where the report holds
-   that split, otherwise as a guaranteed range (lo..hi from the released totals) plus a point estimate
-   that assumes the steps are independent. Step kinds:
-   {t:"y", vals}                         ticket year in the set
-   {t:"d", dim, mode:"i"|"o", vals}      a dimension (category, status, model, ...) only / without these values
-   {t:"g", f, neg}                       a yes/no fact: field filled, repeat ticket, id in text ... (neg: the opposite)
-   {t:"x", src:"title"|"sol", term, neg} the title or solution contains a frequent term */
-const GATES = [
-  ["solutions", "solution", "has a solution"], ["description", "description", "has a description"],
-  ["serial", "vehicle serial", "has a vehicle serial"], ["model_id", "vehicle model id", "has a vehicle model id"],
-  ["baugruppe", "Baugruppe", "names a Baugruppe"], ["fehlercode", "error code", "has an error code"],
-  ["hours", "operating hours", "has operating hours"], ["delivery", "delivery date", "has a delivery date"],
-  ["boiler", "no boilerplate", "is not boilerplate text"],
-];
-const clamp01 = v => Math.max(0, Math.min(1, v));
-const M = (() => {
-  const yearsRows = L("timeline.fill_by_year"), perYear = L("timeline.per_year");
-  const yearN = new Map(perYear.map(r => [String(r.year), r.count]));
-  const yfill = new Map(yearsRows.map(r => [String(r.year), r]));
-  const bc = new Map(L("dimensions.by_category").map(r => [String(r.value), r]));
-  const cats = L("dimensions.categoryId.values").map(r => { const b = bc.get(String(r.value)) || {}; return { k: String(r.value), n: r.count, sol: b.solution_fill, desc: b.description_fill }; });
-  const catN = new Map(cats.map(c => [c.k, c.n]));
-  const restN = Math.max(0, TOTAL - sum(cats, c => c.n));
-  const cells = new Map(L("dimensions.categoryId.by_year").map(r => [String(r.value) + "|" + String(r.year), r.count]));
-  const yearSum = sum(perYear, r => r.count) || 1;
-  const wy = f => sum(yearsRows.filter(r => yearN.has(String(r.year))), r => r.tickets * (r[f] || 0)) * TOTAL / yearSum;
-  const cov = p => { const c = get(R, p); return c && typeof c.present === "number" ? c.present : undefined; };
-  const F = {
-    solutions: get(R, "readiness.solution_present.tickets") ?? wy("solutions"),
-    description: wy("description"),
-    serial: cov("formats.vehicleSerialNo.coverage") ?? wy("serial"),
-    model_id: cov("formats.vehicleModelId.coverage") ?? wy("model_id"),
-    baugruppe: cov("origin.baugruppe.coverage") ?? wy("baugruppe"),
-    fehlercode: cov("formats.fehlercode.coverage") ?? wy("fehlercode"),
-    hours: cov("lifecycle.hours.coverage") ?? wy("hours"),
-    delivery: cov("formats.deliveryDate.coverage") ?? wy("delivery"),
-    boiler: TOTAL - (get(R, "readiness.templated.tickets") ?? 0),
-  };
-  const catF = { solutions: new Map(), description: new Map() }, restF = {};
-  [["solutions", "sol"], ["description", "desc"]].forEach(([f, key]) => {
-    cats.forEach(c => catF[f].set(c.k, Math.round((c[key] != null ? c[key] : F[f] / TOTAL) * c.n)));
-    restF[f] = Math.max(0, Math.min(restN, F[f] - sum([...catF[f].values()], v => v)));
-  });
-  return { yearN, yfill, cats, catN, restN, cells, F, catF, restF, yearKeys: [...yearN.keys()] };
-})();
-
-/* dimensions: values with ticket counts; single-valued ones partition the tickets (the rest is "__rest") */
-const DIMS = {};
-(function () {
-  const cross = (rows, vf) => new Map(rows.map(r => [String(vf(r)) + "|" + String(r.year), r.count]));
-  const add = (key, label, rows, vf, nf, o = {}) => {
-    if (!rows.length) return;
-    const values = rows.map(r => ({ v: String(vf(r)), n: nf(r) }));
-    DIMS[key] = { key, label, values, multi: !!o.multi, restN: o.multi ? 0 : Math.max(0, TOTAL - sum(values, x => x.n)), restLabel: o.restLabel || "other / not set", nOf: new Map(values.map(x => [x.v, x.n])), cross: o.byYear ? cross(o.byYear, vf) : null, pairs: o.pairs || [] };
-  };
-  const v = r => r.value, n = r => r.count;
-  add("cat", "Category", L("dimensions.categoryId.values"), v, n, { byYear: L("dimensions.categoryId.by_year") });
-  add("status", "Status", L("dimensions.statusId.values"), v, n, { byYear: L("dimensions.statusId.by_year") });
-  add("prio", "Priority", L("dimensions.priorityId.values"), v, n, { byYear: L("dimensions.priorityId.by_year") });
-  add("sub", "Sub-status", L("dimensions.subStatusString.values"), v, n, { byYear: L("dimensions.subStatusString.by_year") });
-  add("vstat", "Vehicle status", L("dimensions.vehicleStatus.values"), v, n, { byYear: L("dimensions.vehicleStatus.by_year") });
-  add("show", "Shown in ProTeam", L("dimensions.showInProteam.values"), v, n, { byYear: L("dimensions.showInProteam.by_year") });
-  add("model", "Vehicle model", L("origin.vehicles.models"), r => r.model, n);
-  add("baug", "Baugruppe", L("origin.baugruppe.top"), v, n, { multi: true, byYear: L("origin.baugruppe.by_year"), pairs: L("origin.baugruppe.pairs") });
-  add("warr", "Warranty", L("lifecycle.warranty.states"), r => r.state, n);
-  add("hours", "Operating hours", L("lifecycle.hours.buckets"), r => r.bucket, n, { restLabel: "no value" });
-  add("days", "Days since delivery", L("lifecycle.days_since_delivery.buckets"), r => r.bucket, n, { restLabel: "no value" });
-})();
-const DIM_KEYS = Object.keys(DIMS);
-
-/* yes/no facts and frequent terms */
-const BOOL = new Map();
-GATES.forEach(([id, short, phrase]) => BOOL.set(id, { id, short, phrase, F: M.F[id], field: true }));
-const addFlag = (id, short, phrase, Fv) => { if (typeof Fv === "number" && Fv >= 0) BOOL.set(id, { id, short, phrase, F: Math.round(Fv), field: false }); };
-addFlag("repeat", "repeat ticket", "is a repeat ticket (an earlier ticket on the same vehicle)", get(R, "timeline.recurrence.tickets_with_previous"));
-[["problem", "ip", "problem text"], ["solutions", "is", "solution text"]].forEach(([k, pre, where]) => {
-  (get(R, "text.identifiers." + k + ".by_kind") || []).forEach(b => addFlag(pre + ":" + b.kind, b.kind.replace(/_/g, " ") + " in " + where, "mentions a " + b.kind.replace(/_/g, " ") + " in the " + where, b.tickets_after_cleaning ?? b.tickets));
-});
-const TERMS_ALL = [], TERMDF = new Map();
-[["title", "origin.titles.tokens"], ["title", "origin.titles.bigrams"], ["title", "vocabulary.titles_trigrams.trigrams"], ["sol", "vocabulary.solutions.tokens"], ["sol", "vocabulary.solutions.bigrams"], ["sol", "vocabulary.solutions.trigrams"]].forEach(([src, path]) => {
-  L(path).forEach(r => { const key = src + "|" + r.token; if (!TERMDF.has(key)) { TERMDF.set(key, r.count); TERMS_ALL.push({ src, term: r.token, n: r.count }); } });
-});
-
-function scopeOf(steps) {
-  const sc = { Y: null, dims: {}, multis: [], gates: [], flags: [], terms: [], empty: false };
-  const universe = k => new Set(DIMS[k].values.map(x => x.v).concat(DIMS[k].restN > 0 ? ["__rest"] : []));
-  steps.forEach(s0 => {
-    const s = s0.t === "c" ? { t: "d", dim: "cat", mode: s0.mode, vals: s0.vals } : s0;
-    if (s.t === "y") { const base = sc.Y || new Set(M.yearKeys); sc.Y = new Set([...base].filter(y => (s.mode === "o") !== s.vals.includes(y))); if (!sc.Y.size) sc.empty = true; }
-    else if (s.t === "d" && DIMS[s.dim]) {
-      if (DIMS[s.dim].multi) sc.multis.push({ key: s.dim, vals: s.vals, neg: s.mode === "o" });
-      else { const base = sc.dims[s.dim] || universe(s.dim); sc.dims[s.dim] = new Set([...base].filter(v => (s.mode === "i") === s.vals.includes(v))); if (!sc.dims[s.dim].size) sc.empty = true; }
-    } else if (s.t === "g" && BOOL.has(s.f)) {
-      const list = BOOL.get(s.f).field ? sc.gates : sc.flags, hit = list.find(g => g.id === s.f);
-      if (hit) { if (hit.neg !== !!s.neg) sc.empty = true; } else list.push({ id: s.f, neg: !!s.neg });
-    } else if (s.t === "x") {
-      const hit = sc.terms.find(x => x.src === s.src && x.term === s.term);
-      if (hit) { if (hit.neg !== !!s.neg) sc.empty = true; } else sc.terms.push({ src: s.src, term: s.term, neg: !!s.neg });
-    }
-  });
-  if (sc.Y && sc.Y.size === M.yearKeys.length) sc.Y = null;
-  Object.keys(sc.dims).forEach(k => { if (sc.dims[k].size === universe(k).size) delete sc.dims[k]; });
-  sc.C = sc.dims.cat || null;
-  return sc;
-}
-function sizeOf(sc) {
-  const nC = sc.C ? sum([...sc.C], k => k === "__rest" ? M.restN : (M.catN.get(k) || 0)) : undefined;
-  const nY = sc.Y ? sum([...sc.Y], y => M.yearN.get(y) || 0) : undefined;
-  if (!sc.C && !sc.Y) return { lo: TOTAL, est: TOTAL, hi: TOTAL };
-  if (!sc.Y) return { lo: nC, est: nC, hi: nC, nC };
-  if (!sc.C) return { lo: nY, est: nY, hi: nY, nY };
-  let cell = 0; [...sc.C].forEach(c => { if (c !== "__rest") [...sc.Y].forEach(y => { cell += M.cells.get(c + "|" + y) || 0; }); });
-  const hi = Math.min(nC, nY), lo = Math.min(cell, hi);
-  return { lo, est: Math.min(hi, Math.max(lo, nC * nY / TOTAL)), hi, nC, nY };
-}
-/* a yes/no fact about a field within the scope: bounds and a share (neg: the opposite) */
-function filledOf(f, sc, sz, neg) {
-  const flip = (n, Fv) => (neg ? n - Fv : Fv);
-  const sup = [{ n: TOTAL, F: flip(TOTAL, M.F[f]) }], rates = [];
-  if (sc.Y && f !== "boiler") { const Fy = sum([...sc.Y], y => (M.yearN.get(y) || 0) * ((M.yfill.get(y) || {})[f] || 0)); sup.push({ n: sz.nY, F: flip(sz.nY, Fy) }); rates.push(sz.nY ? flip(sz.nY, Fy) / sz.nY : 0); }
-  if (sc.C && (f === "solutions" || f === "description")) { const Fc = sum([...sc.C], k => k === "__rest" ? M.restF[f] : (M.catF[f].get(k) || 0)); sup.push({ n: sz.nC, F: flip(sz.nC, Fc) }); rates.push(sz.nC ? flip(sz.nC, Fc) / sz.nC : 0); }
-  const G = sup[0].F / TOTAL;
-  const hi = Math.min(sz.hi, ...sup.map(s => s.F));
-  const U = Math.min(sz.hi, ...sup.map(s => s.n - s.F));
-  const p = G > 0 ? clamp01(rates.reduce((a, r) => a * r, 1) / Math.pow(G, Math.max(0, rates.length - 1))) : 0;
-  return { hi, U, lo: Math.max(0, sz.lo - U), p: rates.length ? p : clamp01(G) };
-}
-/* every other kind of step is a set of tickets with a known size (and, for some, a known split by year) */
-function marginsOf(sc) {
-  const out = [];
-  DIM_KEYS.forEach(k => {
-    const d = DIMS[k], set = sc.dims[k]; if (!set || k === "cat") return;
-    const n = sum([...set], v => v === "__rest" ? d.restN : (d.nOf.get(v) || 0));
-    out.push({ n, lo: n, hi: n, crossLo: d.cross ? Y => sum([...set], v => v === "__rest" ? 0 : sum([...Y], y => d.cross.get(v + "|" + y) || 0)) : null });
-  });
-  sc.multis.forEach(m => {
-    const d = DIMS[m.key], ids = m.vals.filter(v => d.nOf.has(v)), counts = ids.map(v => d.nOf.get(v));
-    const total = sum(counts, c => c), mx = Math.max(0, ...counts), covered = get(R, "origin.baugruppe.coverage.present") ?? total;
-    const overlap = sum(d.pairs.filter(p => ids.includes(String(p.value)) && ids.includes(String(p.partner))), p => p.count);
-    const uhi = Math.min(total, covered), est = Math.min(uhi, Math.max(mx, total - overlap));
-    if (m.neg) out.push({ n: TOTAL - est, lo: TOTAL - uhi, hi: TOTAL - mx, crossLo: null });
-    else out.push({ n: est, lo: mx, hi: uhi, crossLo: d.cross ? Y => Math.max(0, ...ids.map(v => sum([...Y], y => d.cross.get(v + "|" + y) || 0))) : null });
-  });
-  sc.flags.forEach(g => { const Fv = BOOL.get(g.id).F, n = g.neg ? TOTAL - Fv : Fv; out.push({ n, lo: n, hi: n, crossLo: null }); });
-  sc.terms.forEach(t => { const Fv = TERMDF.get(t.src + "|" + t.term) || 0, n = t.neg ? TOTAL - Fv : Fv; out.push({ n, lo: n, hi: n, crossLo: null }); });
-  return out;
-}
-function otherOf(m, sc, sz) {
-  let c, nS;
-  if (sc.Y) {
-    nS = sz.nY;
-    if (m.crossLo) { const lo = m.crossLo(sc.Y), hi = Math.min(m.hi, nS); c = { lo: Math.min(lo, hi), hi, est: Math.min(hi, Math.max(lo, m.n * nS / TOTAL)) }; }
-    else { const lo = Math.max(0, m.lo - (TOTAL - nS)), hi = Math.min(m.hi, nS); c = { lo, hi, est: Math.min(hi, Math.max(lo, m.n * nS / TOTAL)) }; }
-  } else { nS = TOTAL; c = { lo: m.lo, hi: m.hi, est: m.n }; }
-  const hi = Math.min(sz.hi, c.hi), U = Math.min(sz.hi, nS - c.lo);
-  return { hi, U, lo: Math.max(0, sz.lo - U), p: nS > 0 ? clamp01(c.est / nS) : 0 };
-}
-const KNOWN = (() => {
-  const k = {}, tri = get(R, "readiness.complete_triple.tickets"), us = get(R, "readiness.usable.tickets");
-  if (typeof tri === "number") k["description|solutions"] = { lo: tri };
-  if (typeof us === "number") k["boiler|solutions"] = { exact: us };
-  return k;
-})();
-function evalScope(sc, raw) {
-  if (sc.empty) return { sz: { lo: 0, est: 0, hi: 0 }, n: { lo: 0, est: 0, hi: 0 }, grade: "exact" };
-  const sz = sizeOf(sc), fb = sc.gates.map(g => filledOf(g.id, sc, sz, g.neg)), om = marginsOf(sc).map(m => otherOf(m, sc, sz)), parts = fb.concat(om);
-  if (!parts.length) return { sz, n: { lo: sz.lo, est: sz.est, hi: sz.hi }, grade: sz.hi - sz.lo < 0.5 ? "exact" : "estimate" };
-  const hi = Math.min(sz.hi, ...parts.map(b => b.hi)), lo = Math.min(hi, Math.max(0, sz.lo - sum(parts, b => b.U)));
-  let est = Math.min(hi, Math.max(lo, sz.est * parts.reduce((a, b) => a * b.p, 1)));
-  const kn = !raw && !sc.C && !sc.Y && !om.length && sc.gates.every(g => !g.neg) && KNOWN[sc.gates.map(g => g.id).sort().join("|")];
-  if (kn) { const klo = kn.exact !== undefined ? kn.exact : kn.lo, khi = kn.exact !== undefined ? kn.exact : hi; const nlo = Math.max(lo, klo), nhi = Math.max(nlo, Math.min(hi, khi)); return { sz, n: { lo: nlo, est: Math.min(nhi, Math.max(nlo, est)), hi: nhi }, grade: nhi - nlo < 0.5 ? "exact" : "estimate" }; }
-  return { sz, n: { lo, est, hi }, grade: hi - lo < 0.5 ? "exact" : "estimate" };
-}
-function profile(steps) {
-  const sc = scopeOf(steps), ev = evalScope(sc), fields = {}, known = {};
-  GATES.forEach(([f]) => {
-    const g = sc.gates.find(x => x.id === f);
-    fields[f] = g ? (g.neg ? 0 : 1) : (ev.sz.est > 0 ? filledOf(f, sc, ev.sz, false).p : 0);
-    known[f] = !!g || (!sc.C && !sc.Y) || (!!sc.Y && f !== "boiler") || (!!sc.C && (f === "solutions" || f === "description"));
-  });
-  const n = { ...ev.n };
-  if (steps.length) { const up = profile(steps.slice(0, -1)).n; n.hi = Math.min(n.hi, up.hi); n.est = Math.max(Math.min(n.lo, n.hi), Math.min(n.est, up.est, n.hi)); n.lo = Math.min(n.lo, n.est); }
-  return { n, grade: n.hi - n.lo < 0.5 ? "exact" : "estimate", fields, known, sc };
-}
-const clone = s => JSON.parse(JSON.stringify(s));
-/* ---------- Include / Ignore: the state of a row is read from the steps, and every change rewrites them cleanly ---------- */
-/* A target is {k:"dim", key, v} (a value of a dimension or "year"), {k:"g", id} (a yes/no fact) or {k:"x", src, term} (a word).
-   States: "inc" included, "exc" ignored, "imp" left out because other values are included, "none" untouched. */
-const universeOf = k => (k === "year" ? M.yearKeys.slice() : DIMS[k].values.map(x => x.v).concat(DIMS[k].restN > 0 && !DIMS[k].multi ? ["__rest"] : []));
-const dimSteps = (steps, k) => steps.filter(s => (k === "year" ? s.t === "y" : s.t === "d" && s.dim === k));
-const dmode = s => (s.mode === "o" ? "o" : "i");
-const mkDim = (k, mode, vals) => (k === "year" ? { t: "y", mode, vals } : { t: "d", dim: k, mode, vals });
-function dimView(steps, k) {
-  const mine = dimSteps(steps, k); if (!mine.length) return { type: "none" };
-  if (k !== "year" && DIMS[k].multi) return { type: "multi", inc: new Set(mine.filter(s => dmode(s) === "i").flatMap(s => s.vals)), exc: new Set(mine.filter(s => dmode(s) === "o").flatMap(s => s.vals)) };
-  const sc = scopeOf(steps), all = universeOf(k), kept = (k === "year" ? sc.Y : sc.dims[k]) || new Set(all);
-  return { type: mine.some(s => dmode(s) === "i") ? "include" : "ignore", kept, all };
-}
-function rowState(steps, t) {
-  if (t.k === "g") { const s = steps.find(x => x.t === "g" && x.f === t.id); return s ? (s.neg ? "exc" : "inc") : "none"; }
-  if (t.k === "x") { const s = steps.find(x => x.t === "x" && x.src === t.src && x.term === t.term); return s ? (s.neg ? "exc" : "inc") : "none"; }
-  const v = dimView(steps, t.key);
-  if (v.type === "none") return "none";
-  if (v.type === "multi") return v.inc.has(t.v) ? "inc" : v.exc.has(t.v) ? "exc" : "none";
-  if (v.type === "include") return v.kept.has(t.v) ? "inc" : "imp";
-  return v.kept.has(t.v) ? "none" : "exc";
-}
-/* the steps after pressing Include or Ignore on a row: pressing the active side clears it, the other side switches */
-function choiceSteps(steps0, t, choice) {
-  if (choice === "clear") { const st = rowState(steps0, t); if (st === "inc") choice = "include"; else if (st === "exc") choice = "ignore"; else return steps0.map(clone); }
-  const steps = steps0.map(clone);
-  if (t.k === "g" || t.k === "x") {
-    const i = steps.findIndex(s => (t.k === "g" ? s.t === "g" && s.f === t.id : s.t === "x" && s.src === t.src && s.term === t.term)), want = choice === "ignore";
-    if (i < 0) steps.push(t.k === "g" ? { t: "g", f: t.id, neg: want } : { t: "x", src: t.src, term: t.term, neg: want });
-    else if (!!steps[i].neg === want) steps.splice(i, 1); else steps[i].neg = want;
-    return steps;
-  }
-  const k = t.key, v = t.v, view = dimView(steps, k); let next;
-  const toggle = (list, x, add) => (add === undefined ? (list.includes(x) ? list.filter(y => y !== x) : list.concat(x)) : add ? (list.includes(x) ? list : list.concat(x)) : list.filter(y => y !== x));
-  if (view.type === "none") next = [mkDim(k, choice === "include" ? "i" : "o", [v])];
-  else if (view.type === "multi") {
-    let inc = [...view.inc], exc = [...view.exc];
-    if (choice === "include") { const had = inc.includes(v); inc = toggle(inc, v); if (!had) exc = toggle(exc, v, false); }
-    else { const had = exc.includes(v); exc = toggle(exc, v); if (!had) inc = toggle(inc, v, false); }
-    next = [].concat(inc.length ? [mkDim(k, "i", inc)] : [], exc.length ? [mkDim(k, "o", exc)] : []);
-  } else if (view.type === "include") {
-    let I = view.all.filter(x => view.kept.has(x));
-    if (choice === "include") I = toggle(I, v);
-    else if (I.includes(v)) { I = toggle(I, v, false); if (!I.length) { next = [mkDim(k, "o", [v])]; I = null; } }
-    if (I) next = I.length ? [mkDim(k, "i", I)] : [];
-  } else {
-    let O = view.all.filter(x => !view.kept.has(x));
-    if (choice === "ignore") O = toggle(O, v);
-    else { next = [mkDim(k, "i", [v])]; O = null; }
-    if (O) next = O.length ? [mkDim(k, "o", O)] : [];
-  }
-  const at = steps.findIndex(s => dimSteps([s], k).length), rest = steps.filter(s => !dimSteps([s], k).length);
-  rest.splice(at < 0 ? rest.length : Math.min(at, rest.length), 0, ...next);
-  return rest;
-}
-/* ---------- (MODEL-END) ---------- */
+__MODEL__
 
 /* ---------- global filters: one ordered list of steps, the same kind the corpus builder uses ---------- */
 const FKEYS = ["year", ...DIM_KEYS];
@@ -1451,7 +1215,7 @@ function signals() {
 }
 function viewOverview() {
   const out = [], pr = profile(G.steps), ex = pr.grade === "exact", t = $("div", "tiles");
-  t.append(tile("Tickets", approx(pr.n.est, ex), G.steps.length ? pct(pr.n.est / TOTAL) + " of all" + (ex ? "" : " · estimate") : "in the export", { scoped: true }));
+  t.append(tile("Tickets", amount(pr), G.steps.length ? pct(pr.n.est / TOTAL) + " of all" + (ex ? "" : pr.grade === "bounded" ? " · range" : " · estimate") : "in the export", { scoped: true }));
   [["solutions", "have a solution"], ["description", "have a description"], ["serial", "have a vehicle serial"], ["model_id", "have a vehicle model id"], ["baugruppe", "name a Baugruppe"]].forEach(([k, l]) => { const v = pr.fields[k]; if (v != null) t.append(tile("Tickets that " + l, pct(v, 0), (v < 0.5 ? "⚠ under half of tickets" : "share of tickets") + (G.steps.length && !pr.known[k] ? " · overall rate" : ""), { scoped: true, warn: v < 0.5 })); });
   const us = get(R, "readiness.usable"); if (us) t.append(tile("Usable", pct(us.share, 0), "solution present, not boilerplate"));
   const rc = get(R, "timeline.recurrence"); if (rc) t.append(tile("Repeat within 90 days", pct(rc.repeat_within_90_share, 0), "of tickets with a serial"));
@@ -1466,7 +1230,11 @@ function viewOverview() {
 
 /* ---------- corpus builder: a tree of steps, compared side by side ---------- */
 const TREE = { nodes: [], next: 1, cmp: null, slot: new Map(), last: 0, focus: 0, hist: [], qf: new Set(["solutions", "description", "serial", "model_id"]) };
-const qscore = pr => { const fs = [...TREE.qf]; return fs.length ? sum(fs, f => pr.fields[f]) / fs.length : 0; };
+/* filterability: the mean fill of the fields ticked above the tree. With the report's quality section the headline
+   score is the usable share (retrievable tickets / tickets) and filterability is shown beside it, never blended. */
+const fscore = pr => { const fs = [...TREE.qf]; return fs.length ? sum(fs, f => pr.fields[f]) / fs.length : 0; };
+const qscore = pr => (pr.q ? pr.q.p : fscore(pr));
+const QNAME = Q ? "usable share" : "quality score", QCAP = QNAME[0].toUpperCase() + QNAME.slice(1);
 const LETTERS = "ABCDEF";
 const nodeOf = id => TREE.nodes.find(n => n.id === id);
 const kids = id => TREE.nodes.filter(n => n.parent === id);
@@ -1529,6 +1297,14 @@ function treeFromHash(txt, cmp, qf) {
   const fs = (qf || "").split(",").filter(f => GATES.some(g => g[0] === f && f !== "boiler")); if (fs.length) TREE.qf = new Set(fs);
 }
 const approx = (n, exactly) => (exactly ? "" : "≈ ") + fmt(Math.round(n));
+/* a profile's ticket count as far as it is known: exact, a guaranteed range from the cube's withheld
+   cells ("bounded"), or an estimate. Without a cube this is approx() exactly. */
+const amount = pr => (pr.grade === "bounded" ? fmt(Math.round(pr.n.lo)) + "–" + fmt(Math.round(pr.n.hi)) : approx(pr.n.est, pr.grade === "exact"));
+/* the steps of an estimated count, for the tooltip on it */
+const guessNote = pr => (pr.grade !== "exact" && pr.grade !== "bounded" && pr.guessed && pr.guessed.length ? "Estimated: the report has no joint split for " + pr.guessed.map(stepLabel).join(", ") + "."
+  : CUBE && pr.grade === "estimated" ? "Estimated: no cut of the cube holds these steps together." : "");
+/* the sentence after a count that is not exact: a guaranteed range, or an estimate within one */
+const gradeText = pr => (pr.grade === "exact" ? "" : (pr.grade === "bounded" ? " The count is guaranteed to lie between " : " The count is an estimate between ") + fmt(Math.round(pr.n.lo)) + " and " + fmt(Math.round(pr.n.hi)) + ".");
 const rangeTxt = n => n.hi - n.lo < 0.5 ? "exact" : "between " + fmt(Math.round(n.lo)) + " and " + fmt(Math.round(n.hi));
 
 function labIntro() {
@@ -1540,7 +1316,10 @@ function labIntro() {
       const w = $("div"), row = $("div", "presets");
       PRESETS.forEach(([t, d, fn]) => { const b = $("button", "preset"); b.type = "button"; b.append($("b", "", t), $("span", "", d)); b.onclick = fn; row.append(b); });
       const cur = $("button", "preset"); cur.type = "button"; cur.append($("b", "", "Use the current global filters"), $("span", "", "Turn every active filter into the first steps of the tree.")); cur.onclick = () => { if (!seedFromGlobal()) { cur.querySelector("span").textContent = "No filter is active. Add one in the bar above first."; } }; row.append(cur);
-      w.append(row); return w;
+      w.append(row);
+      if (CUBE) w.append($("p", "note", "This report has a quality cube: a count is exact where the cube holds the path's split, shown as a range (from–to) where some of its cells were too small to release, and marked ≈ where a step has no joint split. Verdicts and suggestions rank on the worst case unless you switch to the estimate."));
+      else w.append($("p", "note", "Exact branch numbers need a report with a quality cube; this one has none, so counts after several steps are estimates."));
+      return w;
     }
   });
 }
@@ -1634,10 +1413,10 @@ function nodeRow(node, depth, cmpSet) {
   if (folded) lab.append($("span", "thidden", "+" + below(id) + " below"));
   const bar = $("div", "tbar"), tr = $("div", "ttrack"), fl = $("i"); fl.style.width = Math.max(0.4, 100 * pr.n.est / TOTAL) + "%"; if (picked) fl.style.background = colorOfNode(id); tr.append(fl);
   if (!ex) { const w = $("b", "whisk"); w.style.left = (100 * pr.n.lo / TOTAL) + "%"; w.style.width = Math.max(0.5, 100 * (pr.n.hi - pr.n.lo) / TOTAL) + "%"; tr.append(w); }
-  bar.append(tr); hover(bar, () => [[approx(pr.n.est, ex) + " tickets", pathText(id)], [rangeTxt(pr.n), "possible range"], [pct(qscore(pr), 0), "quality score"]]);
-  const n1 = $("div", "tn n1"); n1.append($("b", "", approx(pr.n.est, ex)), $("span", "", pct(pr.n.est / TOTAL, 0) + " of all"));
+  bar.append(tr); hover(bar, () => [[amount(pr) + " tickets", pathText(id)], [rangeTxt(pr.n), "possible range"], [pct(qscore(pr), 0), QNAME]].concat(pr.q ? [[pct(pr.q.kept, 0), "of all usable tickets kept"], [pct(fscore(pr), 0), "filterability"]] : []));
+  const n1 = $("div", "tn n1"), nb = $("b", guessNote(pr) ? "guess" : "", amount(pr)); if (guessNote(pr)) nb.title = guessNote(pr); n1.append(nb, $("span", "", pct(pr.n.est / TOTAL, 0) + " of all"));
   const n2 = $("div", "tn n2"); if (par) { const d = par.n.est ? 1 - pr.n.est / par.n.est : 0; n2.append($("b", d > 0.005 ? "lose" : "same", d > 0.005 ? "−" + pct(d, 0) : "±0"), $("span", "", "vs. step above")); } else n2.append($("b", "same", "start"), $("span", "", "everything"));
-  const n3 = $("div", "tn n3"); n3.append($("b", "", pct(qscore(pr), 0))); n3.append($("span", "", par ? (deltaPts(qscore(pr), qscore(par)) || "same as above") : "quality"));
+  const n3 = $("div", "tn n3"); n3.append($("b", "", pct(qscore(pr), 0))); n3.append($("span", "", par ? (deltaPts(qscore(pr), qscore(par)) || "same as above") : Q ? "usable" : "quality"));
   const act = $("div", "tact");
   if (!isRoot) {
     const t = $("div", "ttri"); t.setAttribute("role", "group");
@@ -1648,6 +1427,12 @@ function nodeRow(node, depth, cmpSet) {
   const more = $("button", "tbtn more", "⋯"); more.type = "button"; more.title = "More: branch, duplicate, collapse, remove…"; more.setAttribute("aria-label", "More actions"); more.onclick = e => { e.stopPropagation(); openMenu(id, more); };
   act.append(add, more);
   const tq = $("div", "tq");
+  if (pr.q) {
+    const chip = (name, val, title, d) => { const c = $("span", "tqc"); c.append($("span", "tqn", name), $("b", "", val)); if (d) c.append(d); c.title = title; tq.append(c); };
+    chip("Usable kept", pct(pr.q.kept, 0), "Share of all usable tickets that are still in this node" + (pr.q.exact ? "" : " (estimate)"));
+    const fd = par ? fscore(pr) - fscore(par) : 0; chip("Filterability", pct(fscore(pr), 0), "Average fill of the fields ticked above the tree", par && Math.abs(fd) >= 0.005 ? $("span", "tqd " + (fd > 0 ? "up" : "dn"), sgn(fd)) : null);
+    const br = breadthOf(steps); BREADTH.forEach(([k]) => { const b = br && br[k]; if (b && b.of) chip(b.name[0].toUpperCase() + b.name.slice(1), b.kept + " of " + b.of, b.lost.length ? "No usable ticket left for: " + b.lost.join(", ") : "Every " + b.one + " with usable tickets is still covered"); });
+  }
   qFields().forEach(([f, short]) => {
     const v = pr.fields[f], c = $("span", "tqc"); c.append($("span", "tqn", short), $("b", "", pct(v, 0)));
     if (par) { const d = v - par.fields[f]; if (Math.abs(d) >= 0.005) c.append($("span", "tqd " + (d > 0 ? "up" : "dn"), sgn(d))); }
@@ -1669,9 +1454,17 @@ function labTree() {
   const cmpSet = new Set(comparedIds());
   return card({
     id: "labtree", wide: true, title: "Filter tree", g: {}, scopeNote: "Tick the paths to compare (up to six). The ⋯ menu has branch, duplicate, flip, collapse and remove.",
-    desc: "Each node is the set of tickets left after the steps above it. The bar is its share of all tickets; the thin line marks the possible range when the count is estimated. Use ✓ ⊘ ○ on a node to include, ignore or unset its step.",
+    desc: "Each node is the set of tickets left after the steps above it. The bar is its share of all tickets; the thin line marks the possible range when the count is not exact. Use ✓ ⊘ ○ on a node to include, ignore or unset its step.",
     body: () => {
-      const w = $("div", "ltree"), q = $("div", "legend qf"), qd = $("span", "qdef"); qd.append($("span", "qi", "Q"), document.createTextNode("Quality score = average fill of:")); qd.title = "Every node shows this score and the share of its tickets in which each of these fields is filled. Tick the fields that matter for your corpus."; q.append(qd);
+      const w = $("div", "ltree"), q = $("div", "legend qf"), qd = $("span", "qdef"); if (Q) {
+        qd.append($("span", "qi", "U"), document.createTextNode("Usable = real problem text and a solution of at least")); qd.title = "A ticket is usable when its problem text is not boilerplate and its solution still has this many words once workflow notes (call-backs, mail, warranty admin, greetings) and dates are removed, and is not shared by " + K + " or more tickets."; q.append(qd);
+        QLADDER.forEach(nw => { const b = $("button"); b.type = "button"; b.setAttribute("aria-pressed", String(QSET.n === nw)); b.textContent = nw + " words"; b.onclick = () => { setMinWords(nw); PAL.sugg.clear(); treeChanged(); }; q.append(b); });
+        if (CUBE) {
+          const rk = $("span", "qdef"); rk.append(document.createTextNode("Rank on:")); rk.title = "Worst case: a gain the report cannot guarantee is marked uncertain and suggestions are ordered by what is guaranteed, so a path never wins on a guess. Estimate: verdicts and suggestions use the point values only."; q.append(rk);
+          [[true, "worst case"], [false, "estimate"]].forEach(([low, label]) => { const b = $("button"); b.type = "button"; b.setAttribute("aria-pressed", String(RANK.low === low)); b.textContent = label; b.onclick = () => { setRank(low); PAL.sugg.clear(); treeChanged(); }; q.append(b); });
+        }
+        const fd = $("span", "qdef"); fd.append($("span", "qi", "F"), document.createTextNode("Filterability = average fill of:")); fd.title = "How well the tickets can be narrowed down. Shown beside the usable share, never mixed into it."; q.append(fd);
+      } else { qd.append($("span", "qi", "Q"), document.createTextNode("Quality score = average fill of:")); qd.title = "Every node shows this score and the share of its tickets in which each of these fields is filled. Tick the fields that matter for your corpus."; q.append(qd); }
       GATES.filter(g => g[0] !== "boiler").forEach(([f, short]) => { const b = $("button"); b.type = "button"; b.setAttribute("aria-pressed", String(TREE.qf.has(f))); b.textContent = short; b.onclick = () => { if (TREE.qf.has(f)) { if (TREE.qf.size > 1) TREE.qf.delete(f); } else TREE.qf.add(f); treeChanged(); }; q.append(b); });
       const tb = $("div", "ttools"), tool = (label, title, fn, off) => { const b = $("button", "tbtn", label); b.type = "button"; b.title = title; b.disabled = !!off; b.onclick = fn; tb.append(b); };
       tool("↶ Undo", "Undo the last change to the tree", undoTree, !TREE.hist.length);
@@ -1680,9 +1473,9 @@ function labTree() {
       tool("Compare all ends", "Compare every path that has no steps below it", () => { TREE.cmp = null; treeChanged(); }, !TREE.nodes.length);
       tool("Compare none", "Untick every path", () => { TREE.cmp = new Set(); treeChanged(); }, !TREE.nodes.length);
       tool("Clear tree", "Remove every step", clearTree, !TREE.nodes.length);
-      const hd = $("div", "thead"); ["", "", "Step", "Share of all tickets", "Tickets left", "Change", "Quality", ""].forEach(t => hd.append($("span", "", t)));
+      const hd = $("div", "thead"); ["", "", "Step", "Share of all tickets", "Tickets left", "Change", Q ? "Usable" : "Quality", ""].forEach(t => hd.append($("span", "", t)));
       const body = $("div", "tbody"); body.append(nodeRow({ id: 0, step: null }, 0, cmpSet));
-      q.append($("p", "qhelp", "Every node shows this score and the fill of each field below. Switch fields on or off to match what a technician needs.")); w.append(q, tb, hd, body); if (!TREE.nodes.length) w.append($("div", "note", "Press + Step on the first node (or / anywhere), or start from one of the examples above."));
+      q.append($("p", "qhelp", Q ? "Every node shows its usable share, the share of all usable tickets it keeps, its filterability and how many models and Baugruppen still have usable tickets. Verdicts weigh the usable share against the usable tickets given up." : "Every node shows this score and the fill of each field below. Switch fields on or off to match what a technician needs.")); w.append(q, tb, hd, body); if (!TREE.nodes.length) w.append($("div", "note", "Press + Step on the first node (or / anywhere), or start from one of the examples above."));
       return w;
     }
   });
@@ -1690,14 +1483,40 @@ function labTree() {
 /* ---------- decision support: what each filter does to tickets and quality ---------- */
 /* a verdict compares the quality gained with the tickets given up; always icon + words, never colour alone */
 function verdictOf(par, pr) {
+  if (pr.q && par.q) return verdictQ(par, pr);
   const dq = (qscore(pr) - qscore(par)) * 100, lost = par.n.est ? (1 - pr.n.est / par.n.est) * 100 : 0, a = Math.abs(dq).toFixed(0), l = lost.toFixed(0);
   if (lost < 1 && Math.abs(dq) < 0.5) return { k: "flat", icon: "＝", label: "No effect", text: "Changes neither the ticket count nor the quality." };
-  if (dq < -0.5) return { k: "hurt", icon: "▼", label: "Lowers quality", text: "Quality falls " + a + " points while " + l + "% of the tickets go." };
+  if (dq <= -0.5) return { k: "hurt", icon: "▼", label: "Lowers quality", text: "Quality falls " + a + " points while " + l + "% of the tickets go." };
   if (Math.abs(dq) < 0.5) return { k: "flat", icon: "◆", label: "Only shrinks", text: "Removes " + l + "% of the tickets without changing the quality score." };
   const e = dq / Math.max(lost, 0.5);
   if (e >= 0.8) return { k: "gain", icon: "▲", label: "Strong gain", text: "Raises quality by " + a + " points and gives up " + l + "% of the tickets: a strong trade." };
   if (e >= 0.25) return { k: "fair", icon: "▲", label: "Good trade", text: "Raises quality by " + a + " points for " + l + "% of the tickets: a reasonable trade." };
   return { k: "costly", icon: "▲", label: "Costly gain", text: "Raises quality by only " + a + " points but gives up " + l + "% of the tickets: probably not worth it." };
+}
+/* with the quality section: precision (usable share), recall (usable tickets kept) and breadth */
+function verdictQ(par, pr) {
+  const v = verdictEst(par, pr);
+  /* on the worst case a gain must hold there too: the report cannot promise what only the estimate shows.
+     The worst case only ever withholds a gain; it never turns an unknown into a loss (review finding). */
+  if (CUBE && RANK.low && ["gain", "fair", "costly"].includes(v.k) && !(rankOf(pr).p > par.q.p + 0.005))
+    return { ...v, k: "flat", icon: "?", label: "Uncertain gain" + (v.drops.length ? " ⚠" : ""), text: "The estimate gains, but the report cannot guarantee it: in the worst case the usable share does not rise above the step before's estimate. " + v.text };
+  return v;
+}
+/* precision (usable share), recall (usable tickets kept) and breadth, on the estimate */
+function verdictEst(par, pr) {
+  const dq = (pr.q.p - par.q.p) * 100, a = Math.abs(dq).toFixed(0), lost = par.n.est ? 1 - pr.n.est / par.n.est : 0;
+  const keep = par.q.r > 0 ? Math.min(1, pr.q.r / par.q.r) : 1, k = pct(keep, 0);
+  const junk0 = par.n.est - par.q.r, junk1 = pr.n.est - pr.q.r, gone = junk0 > 0 ? pct(Math.max(0, 1 - junk1 / junk0), 0) : "0%";
+  const b0 = breadthOf(par.steps), b1 = breadthOf(pr.steps), drops = BREADTH.map(([key]) => (b0 && b1 && b0[key] && b1[key] && b0[key].kept > b1[key].kept ? (b0[key].kept - b1[key].kept) + " " + b0[key].name : "")).filter(Boolean);
+  const warn = drops.length ? " Leaves no usable ticket for " + drops.join(" and ") + "." : "";
+  const v = (kk, icon, label, text) => ({ k: kk, icon, label: label + (drops.length ? " ⚠" : ""), text: text + warn, drops });
+  if (lost < 0.01 && Math.abs(dq) < 0.5) return v("flat", "＝", "No effect", "Changes neither the ticket count nor the usable share.");
+  if (dq <= -0.5) return v("hurt", "▼", "Lowers usable share", "The usable share falls " + a + " points; " + k + " of the usable tickets stay.");
+  if (Math.abs(dq) < 0.5) return pr.q.known ? v("flat", "◆", "Only shrinks", "Removes " + pct(lost, 0) + " of the tickets, usable and unusable alike.") : v("flat", "?", "Effect unknown", "Removes " + pct(lost, 0) + " of the tickets. The report has no usable-ticket split for this step, so its effect on the usable share cannot be measured.");
+  const body = "Raises the usable share by " + a + " points: removes " + gone + " of the unusable tickets and keeps " + k + " of the usable ones";
+  if (keep >= 0.95) return v("gain", "▲", "Strong gain", body + ".");
+  if (keep >= 0.8) return v("fair", "▲", "Good trade", body + ": a reasonable trade.");
+  return v("costly", "▲", "Costly gain", body + ": too many usable tickets go.");
 }
 function focusId() {
   if (TREE.focus && exists(TREE.focus) && TREE.focus !== 0) return TREE.focus;
@@ -1725,17 +1544,18 @@ function labGuide() {
   return card({
     id: "labguide", wide: true, title: "Decision guide for the selected step", g: {}, scopeNote: "Click any node in the tree to guide it. The estimates follow the same rules as the tree.",
     desc: "What this one filter does to the corpus, field by field, and what to try next. A verdict weighs the **quality gained** against the **tickets given up**.",
-    how: "Quality is the average fill of the fields you chose above the tree. A star marks a field for which the report has no split for this filter, so the overall rate is shown: such a filter changes how many tickets are left, but the report cannot say how it changes quality.",
+    how: (Q ? "The usable share counts tickets with real problem text and a solution of at least the chosen number of words, workflow notes removed. Filterability and the fields below are fills of the fields you chose above the tree. " : "Quality is the average fill of the fields you chose above the tree. ") + "A star marks a field for which the report has no split for this filter, so the overall rate is shown: such a filter changes how many tickets are left, but the report cannot say how it changes quality.",
     body: () => {
       const w = $("div", "guide"), hd = $("div", "ghead");
       hd.append(stepChips(node.step), $("span", "tverd big v-" + vd.k, vd.icon + " " + vd.label)); w.append(hd);
-      const grade = pr.grade === "exact" ? "" : " The count is an estimate between " + fmt(Math.round(pr.n.lo)) + " and " + fmt(Math.round(pr.n.hi)) + ".";
-      w.append($("p", "gtext", vd.text + " Tickets: " + approx(par.n.est, par.grade === "exact") + " → " + approx(pr.n.est, pr.grade === "exact") + "." + grade));
+      const grade = gradeText(pr);
+      w.append($("p", "gtext", vd.text + " Tickets: " + amount(par) + " → " + amount(pr) + "." + grade));
       /* 1. before and after, field by field */
       w.append($("div", "sub3", "Before and after, field by field"));
       const ba = $("div", "gba"); ["Field", "Above", "After", "Change", "0 – 100 %"].forEach(h => ba.append($("span", "gh", h)));
       const row = (label, a, b, strong, star) => { ba.append($("span", "gl" + (strong ? " strong" : ""), label + (star ? " *" : "")), $("span", "gn", pct(a, 0)), $("span", "gn" + (strong ? " strong" : ""), pct(b, 0)), $("span", "gd " + (b > a + 0.004 ? "up" : b < a - 0.004 ? "dn" : ""), sgn(b - a)), dumbbell(a, b)); };
-      row("Quality score", qscore(par), qscore(pr), true, false);
+      row(QCAP, qscore(par), qscore(pr), true, false);
+      if (pr.q) { row("Usable tickets kept", par.q.kept, pr.q.kept, false, !pr.q.known); row("Filterability", fscore(par), fscore(pr), false, false); }
       fs.forEach(([f, short]) => row(short, par.fields[f], pr.fields[f], false, !pr.known[f] && !(node.step.t === "g" && node.step.f === f)));
       row("Tickets left", par.n.est / TOTAL, pr.n.est / TOTAL, false, false);
       w.append(ba);
@@ -1743,28 +1563,28 @@ function labGuide() {
       /* 2. what each value contributes */
       const st = node.step;
       if ((st.t === "d" || st.t === "y") && st.vals.length) {
-        const dimLabel = st.t === "y" ? "Year" : (DIMS[st.dim] || { label: st.dim }).label, known = st.t === "y" || st.dim === "cat";
+        const dimLabel = st.t === "y" ? "Year" : (DIMS[st.dim] || { label: st.dim }).label, known = !!Q || st.t === "y" || st.dim === "cat";
         w.append($("div", "sub3", "Each " + dimLabel.toLowerCase() + " on its own"));
         const rows = st.vals.map(v => ({ v, pr: profile(parSteps.concat(oneValue(st, v))) })), qs = rows.map(r => qscore(r.pr)), best = Math.max(...qs), worst = Math.min(...qs);
-        const tb = $("div", "gval"); const head = ["Value", "Tickets", "Share of step above", "Quality"].concat(fs.map(f => f[1])); tb.style.gridTemplateColumns = "minmax(90px,1.2fr) 90px 120px 80px " + fs.map(() => "78px").join(" ");
+        const tb = $("div", "gval"); const head = ["Value", "Tickets", "Share of step above", Q ? "Usable" : "Quality"].concat(fs.map(f => f[1])); tb.style.gridTemplateColumns = "minmax(90px,1.2fr) 90px 120px 80px " + fs.map(() => "78px").join(" ");
         head.forEach(h => tb.append($("span", "gh", h)));
         rows.forEach(r => {
           const q = qscore(r.pr), tag = rows.length > 1 && known && best - worst > 0.01 ? (q === best ? " ▲ best" : q === worst ? " ▼ lowest" : "") : "";
-          tb.append($("span", "gl strong", (r.v === "__rest" && DIMS[st.dim] ? DIMS[st.dim].restLabel : r.v) + tag), $("span", "gn", approx(r.pr.n.est, r.pr.grade === "exact")), $("span", "gn", pct(par.n.est ? r.pr.n.est / par.n.est : 0, 0)), $("span", "gn strong", pct(q, 0)));
+          tb.append($("span", "gl strong", (r.v === "__rest" && DIMS[st.dim] ? DIMS[st.dim].restLabel : r.v) + tag), $("span", "gn", amount(r.pr)), $("span", "gn", pct(par.n.est ? r.pr.n.est / par.n.est : 0, 0)), $("span", "gn strong", pct(q, 0)));
           fs.forEach(([f]) => tb.append($("span", "gn" + (r.pr.known[f] ? "" : " star"), pct(r.pr.fields[f], 0) + (r.pr.known[f] ? "" : " *"))));
         });
         w.append(tb);
-        w.append($("p", "note", known ? "Quality differs between " + dimLabel.toLowerCase() + " values because the report splits " + (st.t === "y" ? "every field" : "solution and description") + " by " + dimLabel.toLowerCase() + ". Fields marked * are overall rates." : "The report has no quality split by " + dimLabel.toLowerCase() + ": values differ in size, but their quality can only be estimated at the overall rate. Choose by ticket volume and by what you know about them, or extend the report with a field-by-" + dimLabel.toLowerCase() + " table."));
+        w.append($("p", "note", Q ? "The usable share of each value is measured: the report splits its usable tickets by " + dimLabel.toLowerCase() + "." : known ? "Quality differs between " + dimLabel.toLowerCase() + " values because the report splits " + (st.t === "y" ? "every field" : "solution and description") + " by " + dimLabel.toLowerCase() + ". Fields marked * are overall rates." : "The report has no quality split by " + dimLabel.toLowerCase() + ": values differ in size, but their quality can only be estimated at the overall rate. Choose by ticket volume and by what you know about them, or extend the report with a field-by-" + dimLabel.toLowerCase() + " table."));
         if (st.vals.length > 1) { const b = $("button", "tbtn", "Compare each " + dimLabel.toLowerCase() + " as its own branch"); b.type = "button"; b.title = "Adds one branch per value next to this step and compares them"; b.onclick = () => compareEachValue(id); w.append(b); }
       } else w.append($("p", "note", "This step is a single yes/no condition, so there is no per-value breakdown."));
       /* 3. what to try next */
       const sg = suggest(steps).slice(0, 4);
       w.append($("div", "sub3", "Best next steps from here"));
-      if (!sg.length) w.append($("p", "note", "No single step raises quality further without removing most tickets."));
+      if (!sg.length) w.append($("p", "note", "No single step raises the " + QNAME + " further without removing most tickets."));
       sg.forEach(c => {
         const r = $("div", "gnext"), b = $("button", "tbtn", "+ Add below"); b.type = "button";
         b.onclick = () => { pushHist(); const nid = addStep(id, clone(c.step), true); TREE.focus = nid; treeChanged(); };
-        r.append($("span", "gl strong", stepLabel(c.step)), $("span", "gn", "keeps " + pct(c.keep, 0)), $("span", "gn", "quality " + pct(c.from, 0) + " → " + pct(c.to, 0)), b); w.append(r);
+        r.append($("span", "gl strong", stepLabel(c.step)), $("span", "gn", "keeps " + pct(c.keep, 0)), $("span", "gn", (Q ? "usable " : "quality ") + pct(c.from, 0) + " → " + pct(c.to, 0)), b); w.append(r);
       });
       return w;
     }
@@ -1774,8 +1594,8 @@ function labGuide() {
 function labLadder() {
   const id = focusId(); if (!id) return null;
   const ids = [0].concat(pathIds(id)), fs = qFields(), profs = ids.map(i => profile(pathOf(i)));
-  const rows = [{ label: "Tickets left", key: "n" }, { label: "Quality score", key: "q" }].concat(fs.map(([f, short]) => ({ label: short, key: f })));
-  const val = (r, c) => { const p = profs[ids.indexOf(c.key)]; return r.key === "n" ? p.n.est / TOTAL : r.key === "q" ? qscore(p) : p.fields[r.key]; };
+  const rows = [{ label: "Tickets left", key: "n" }, { label: QCAP, key: "q" }].concat(Q ? [{ label: "Usable tickets kept", key: "k" }, { label: "Filterability", key: "fs" }] : []).concat(fs.map(([f, short]) => ({ label: short, key: f })));
+  const val = (r, c) => { const p = profs[ids.indexOf(c.key)]; return r.key === "n" ? p.n.est / TOTAL : r.key === "q" ? qscore(p) : r.key === "k" ? p.q.kept : r.key === "fs" ? fscore(p) : p.fields[r.key]; };
   return card({
     id: "labladder", wide: true, title: "How quality changes along this path", g: {}, scopeNote: "Follows the node selected in the tree.",
     desc: "Each column is one more step on the path to the selected node. Read **across a row** to see where a field improves or drops, and **down a column** to see what the corpus looks like after that step.",
@@ -1792,10 +1612,10 @@ function scatterDraw(pts, base, W) {
   for (let v = 0; v <= 1.001; v += 0.25) svg.append(S("line", { x1: X(v), x2: X(v), y1: mt, y2: mt + ph, class: "grid-l" }), S("text", { x: X(v), y: mt + ph + 20, class: "tick", "text-anchor": "middle" }, pct(v, 0)));
   const yt = []; for (let v = Math.ceil(y0 * 10) / 10; v <= 1.001; v += 0.1) yt.push(v);
   yt.forEach(v => svg.append(S("line", { x1: ml, x2: W - mr, y1: Y(v), y2: Y(v), class: "grid-l" }), S("text", { x: ml - 8, y: Y(v) + 4, class: "tick", "text-anchor": "end" }, pct(v, 0))));
-  svg.append(S("text", { x: ml + pw / 2, y: H - 10, class: "xlab", "text-anchor": "middle" }, "Tickets kept (share of all) →"), S("text", { x: 14, y: mt + ph / 2, class: "xlab", "text-anchor": "middle", transform: `rotate(-90 14 ${mt + ph / 2})` }, "Quality score →"));
+  svg.append(S("text", { x: ml + pw / 2, y: H - 10, class: "xlab", "text-anchor": "middle" }, "Tickets kept (share of all) →"), S("text", { x: 14, y: mt + ph / 2, class: "xlab", "text-anchor": "middle", transform: `rotate(-90 14 ${mt + ph / 2})` }, QCAP + " →"));
   svg.append(S("text", { x: X(1) - 6, y: Y(1) + 16, class: "xlab", "text-anchor": "end" }, "better ↗"));
   const b = S("g", { class: "mark" }); b.append(S("circle", { cx: X(base.x), cy: Y(base.y), r: 8, fill: "none", stroke: "var(--ink2)", "stroke-width": 2 }), S("text", { x: X(base.x) - 14, y: Y(base.y) + 4, class: "xlab", "text-anchor": "end" }, "All tickets"));
-  hover(b, () => [[pct(base.y, 0), "quality score of all tickets"]]); svg.append(b);
+  hover(b, () => [[pct(base.y, 0), QNAME + " of all tickets"]]); svg.append(b);
   pts.forEach(p => {
     const g = S("g", { class: "mark" }), c = S("circle", { cx: X(p.x), cy: Y(p.y), r: 10, class: "sdot" }); c.style.fill = p.color;
     if (p.xhi - p.xlo > 0.004) g.append(S("line", { x1: X(p.xlo), x2: X(p.xhi), y1: Y(p.y), y2: Y(p.y), stroke: p.color, "stroke-width": 3, opacity: 0.55 }));
@@ -1809,14 +1629,14 @@ function labCompare(ids) {
   const prs = ids.map(id => ({ id, pr: profile(pathOf(id)) }));
   out.push(card({
     id: "labscatter", wide: true, title: "Corpus size against data quality", g: {}, scopeNote: "Computed from the tree above.",
-    rows: prs.map(({ id, pr }) => ({ scenario: letterOf(id), steps: pathText(id), tickets: Math.round(pr.n.est), "share of all": pr.n.est / TOTAL, "quality score": qscore(pr) })),
-    desc: "Each dot is a ticked row. Right means more tickets kept, up means better data in the fields you picked for the quality score. A good filter keeps **many tickets** and sits **high**.",
+    rows: prs.map(({ id, pr }) => ({ scenario: letterOf(id), steps: pathText(id), tickets: Math.round(pr.n.est), "share of all": pr.n.est / TOTAL, [QNAME]: qscore(pr), ...(pr.q ? { "usable kept": pr.q.kept, filterability: fscore(pr) } : {}) })),
+    desc: (Q ? "Each dot is a ticked row. Right means more tickets kept, up means a larger share of them is usable." : "Each dot is a ticked row. Right means more tickets kept, up means better data in the fields you picked for the quality score.") + " A good filter keeps **many tickets** and sits **high**.",
     how: "The hollow ring is the unfiltered corpus. A thin horizontal line through a dot marks the possible range of its size when it is estimated. Hover a dot for its steps. Letters match the tree and the table below.",
     body: () => { const lg = $("div", "legend"); prs.forEach(({ id }) => { const s = $("span"); const sw = $("i", "sw b"); sw.style.background = colorOfNode(id); s.append(sw, document.createTextNode(" " + letterOf(id) + "  " + pathOf(id).map(shortStep).join(" · "))); lg.append(s); });
-      const w = $("div"); w.append(responsive(W => scatterDraw(prs.map(({ id, pr }) => ({ letter: letterOf(id), color: colorOfNode(id), x: pr.n.est / TOTAL, xlo: pr.n.lo / TOTAL, xhi: pr.n.hi / TOTAL, y: qscore(pr), tip: [[approx(pr.n.est, pr.grade === "exact") + " tickets · " + pct(pr.n.est / TOTAL, 0), letterOf(id) + ": " + pathText(id)], [pct(qscore(pr), 0), "quality score"], [rangeTxt(pr.n), "size"]] })), { x: 1, y: qscore(base) }, W)), lg); return w; }
+      const w = $("div"); w.append(responsive(W => scatterDraw(prs.map(({ id, pr }) => ({ letter: letterOf(id), color: colorOfNode(id), x: pr.n.est / TOTAL, xlo: pr.n.lo / TOTAL, xhi: pr.n.hi / TOTAL, y: qscore(pr), tip: [[amount(pr) + " tickets · " + pct(pr.n.est / TOTAL, 0), letterOf(id) + ": " + pathText(id)], [pct(qscore(pr), 0), QNAME], [rangeTxt(pr.n), "size"]] })), { x: 1, y: qscore(base) }, W)), lg); return w; }
   }));
   const fieldRows = [["score"]].concat(GATES.map(g => [g[0]]));
-  const label = { score: "Quality score", solutions: "Solution", description: "Description", serial: "Vehicle serial", model_id: "Vehicle model id", baugruppe: "Baugruppe", fehlercode: "Error code", hours: "Operating hours", delivery: "Delivery date", boiler: "Not boilerplate" };
+  const label = { score: QCAP, solutions: "Solution", description: "Description", serial: "Vehicle serial", model_id: "Vehicle model id", baugruppe: "Baugruppe", fehlercode: "Error code", hours: "Operating hours", delivery: "Delivery date", boiler: "Not boilerplate" };
   out.push(card({
     id: "labquality", wide: true, title: "Data quality of what is left", g: {}, scopeNote: "Computed from the tree above.",
     rows: [{ field: "tickets", All: Math.round(TOTAL), ...Object.fromEntries(prs.map(({ id, pr }) => [letterOf(id), Math.round(pr.n.est)])) }].concat(fieldRows.map(([k]) => ({ field: label[k], All: k === "score" ? qscore(base) : base.fields[k], ...Object.fromEntries(prs.map(({ id, pr }) => [letterOf(id), k === "score" ? qscore(pr) : pr.fields[k]])) }))),
@@ -1824,13 +1644,13 @@ function labCompare(ids) {
     how: "Read down a column to see what a corpus looks like, and along a row to see which scenario fills a field best. A **star** marks a field for which the report has no split by your categories, so the overall rate is shown and cannot tell the scenarios apart.",
     body: () => heat({ max: 1, fmt: v => pct(v, 0), mark: (r, c) => { if (r.key === "score" || c.key === "all") return ""; const pr = prs.find(x => x.id === c.key).pr; return pr.known[r.key] ? "" : "*"; }, rows: fieldRows.map(([k]) => ({ label: label[k], key: k })), cols: [{ label: "All", key: "all", tip: [["All tickets", pct(1, 0)]] }].concat(prs.map(({ id }) => ({ label: letterOf(id), key: id, tip: [[letterOf(id), pathText(id)]] }))), val: (r, c) => { const pr = c.key === "all" ? base : prs.find(x => x.id === c.key).pr; return r.key === "score" ? qscore(pr) : pr.fields[r.key]; } })
   }));
-  const txt = () => prs.map(({ id, pr }) => letterOf(id) + ": " + pathText(id) + " | " + approx(pr.n.est, pr.grade === "exact") + " tickets (" + pct(pr.n.est / TOTAL, 0) + " of all, " + rangeTxt(pr.n) + ") | " + pct(qscore(pr), 0) + " quality score").join("\n");
+  const txt = () => prs.map(({ id, pr }) => letterOf(id) + ": " + pathText(id) + " | " + amount(pr) + " tickets (" + pct(pr.n.est / TOTAL, 0) + " of all, " + rangeTxt(pr.n) + ") | " + pct(qscore(pr), 0) + " " + QNAME + (pr.q ? ", " + pct(pr.q.kept, 0) + " of usable kept, " + pct(fscore(pr), 0) + " filterability" : "")).join("\n");
   const copy = $("button", "ghost", "Copy as text"); copy.type = "button";
   copy.onclick = () => { const t = txt(); const done = () => { copy.textContent = "Copied"; setTimeout(() => { copy.textContent = "Copy as text"; }, 1500); }; if (navigator.clipboard) navigator.clipboard.writeText(t).then(done, () => { }); else { const ta = $("textarea"); ta.value = t; document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove(); done(); } };
   out.push(card({
     id: "labtable", wide: true, title: "Scenarios side by side", g: {}, scopeNote: "Computed from the tree above.", controls: [copy],
-    desc: "The ticked rows with their full path, size and quality score, ready to share as text.",
-    body: () => { const t = table(prs.map(({ id, pr }) => ({ scenario: letterOf(id), steps: pathText(id), tickets: approx(pr.n.est, pr.grade === "exact"), "share of all": pct(pr.n.est / TOTAL, 0), range: rangeTxt(pr.n), "quality score": pct(qscore(pr), 0) }))); t.classList.add("wrapcells"); return t; }
+    desc: "The ticked rows with their full path, size and " + QNAME + ", ready to share as text.",
+    body: () => { const t = table(prs.map(({ id, pr }) => ({ scenario: letterOf(id), steps: pathText(id), tickets: amount(pr), "share of all": pct(pr.n.est / TOTAL, 0), range: rangeTxt(pr.n), [QNAME]: pct(qscore(pr), 0), ...(pr.q ? { "usable kept": pct(pr.q.kept, 0), filterability: pct(fscore(pr), 0) } : {}) }))); t.classList.add("wrapcells"); return t; }
   }));
   return out;
 }
@@ -1901,6 +1721,8 @@ function changed() { deriveF(); syncBar(); writeHash(); renderView(); if (PAL.el
 function writeHash() {
   const p = new URLSearchParams(); if (G.steps.length) p.set("g", G.steps.map(stepStr).join("!")); if (T.q) p.set("q", T.q); if (T.min) p.set("min", String(T.min));
   if (TREE.nodes.length) { if (TREE.focus) p.set("foc", String(TREE.focus)); p.set("tree", treeToHash()); if (TREE.cmp) p.set("cmp", [...TREE.cmp].join(",")); p.set("qf", [...TREE.qf].join(",")); }
+  if (Q && QSET.n !== Q.default_min_words) p.set("qn", String(QSET.n));
+  if (CUBE && !RANK.low) p.set("rk", "e");
   const s = p.toString(); try { history.replaceState(null, "", "#" + CUR + (s ? "?" + s : "")); } catch (e) { }
 }
 function readHash() {
@@ -1910,7 +1732,8 @@ function readHash() {
     const vals = (p.get(key) || "").split(",").filter(Boolean); if (vals.length && !p.get("g")) { const st = mk(vals); if (strStep(stepStr(st))) G.steps.push(st); }
   });
   T.q = p.get("q") || ""; T.min = Math.max(0, parseInt(p.get("min"), 10) || 0);
-  treeFromHash(p.get("tree"), p.get("cmp"), p.get("qf")); TREE.focus = TREE.nodes.some(n => n.id === Number(p.get("foc"))) ? Number(p.get("foc")) : 0;
+  treeFromHash(p.get("tree"), p.get("cmp"), p.get("qf")); if (p.get("qn")) setMinWords(Number(p.get("qn")));
+  if (p.get("rk") === "e") setRank(false); TREE.focus = TREE.nodes.some(n => n.id === Number(p.get("foc"))) ? Number(p.get("foc")) : 0;
   if (VIEWS.some(x => x.id === v)) CUR = v;
   deriveF();
 }
@@ -1958,9 +1781,9 @@ function metric(label, value, base, o = {}) {
 const deltaPts = (v, b) => { const d = (v - b) * 100; return Math.abs(d) < 0.5 ? "" : (d > 0 ? "▲ " : "▼ ") + Math.abs(d).toFixed(0) + " pts"; };
 function buildImpact(steps) {
   const pr = profile(steps), base = profile([]), ex = pr.grade === "exact", on = steps.length > 0, out = [];
-  const left = metric("tickets left", approx(pr.n.est, ex), 0, { delta: on ? pct(pr.n.est / TOTAL, 0) + " of all" : "all tickets", tip: [[approx(pr.n.est, ex) + " of " + fmt(TOTAL), "tickets after all filters"], [rangeTxt(pr.n), "possible range"]] });
+  const left = metric("tickets left", amount(pr), 0, { delta: on ? pct(pr.n.est / TOTAL, 0) + " of all" : "all tickets", tip: [[amount(pr) + " of " + fmt(TOTAL), "tickets after all filters"], [rangeTxt(pr.n), "possible range"]] });
   const track = $("div", "mtrack"), fill = $("i"); fill.style.width = Math.max(0.5, 100 * pr.n.est / TOTAL) + "%"; track.append(fill); left.append(track); out.push(left);
-  out.push(metric("quality", pct(qscore(pr), 0), 0, { delta: on ? deltaPts(qscore(pr), qscore(base)) : "", tip: [["Average fill of the quality fields", [...TREE.qf].map(f => (BOOL.get(f) || {}).short).join(", ")], ["Change them in the corpus builder", ""]] }));
+  out.push(metric(Q ? "usable" : "quality", pct(qscore(pr), 0), 0, { delta: on ? deltaPts(qscore(pr), qscore(base)) : "", tip: Q ? [["Usable share", "real problem text and a solution of at least " + QSET.n + " words"], [pct(pr.q.kept, 0), "of all usable tickets kept"], ["Change the word count in the corpus builder", ""]] : [["Average fill of the quality fields", [...TREE.qf].map(f => (BOOL.get(f) || {}).short).join(", ")], ["Change them in the corpus builder", ""]] }));
   [...TREE.qf].slice(0, 4).forEach(f => { const g = BOOL.get(f); out.push(metric(g.short, pct(pr.fields[f], 0), 0, { delta: on ? deltaPts(pr.fields[f], base.fields[f]) : "", tip: [[pct(pr.fields[f], 0), g.short + " filled"], pr.known[f] ? ["", "from the report's split for these filters"] : ["", "overall rate: the report has no split for these filters"]] })); });
   return out;
 }
@@ -2051,13 +1874,18 @@ function splitRows(toks) {
   return DIM_KEYS.map(k => ({ g: "Split", label: "by " + DIMS[k].label.toLowerCase(), split: k })).concat([{ g: "Split", label: "by year", split: "year" }]).filter(r => toks.every(t => ("split branches " + r.label).includes(t)));
 }
 function suggest(steps) {
-  const key = steps.map(stepStr).join("!") + "|" + [...TREE.qf].join(","); if (PAL.sugg.has(key)) return PAL.sugg.get(key);
+  const key = steps.map(stepStr).join("!") + "|" + [...TREE.qf].join(",") + "|" + QSET.n + "|" + RANK.low; if (PAL.sugg.has(key)) return PAL.sugg.get(key);
   const base = profile(steps), cands = [];
   DIM_KEYS.forEach(k => { const d = DIMS[k]; d.values.forEach(v => { cands.push(dStep(k, "i", v.v), dStep(k, "o", v.v)); }); });
   BOOL.forEach(bv => { cands.push({ t: "g", f: bv.id, neg: false }, { t: "g", f: bv.id, neg: true }); });
   TERMS_ALL.slice().sort((a, b) => b.n - a.n).slice(0, 25).forEach(t => { cands.push({ t: "x", src: t.src, term: t.term, neg: false }, { t: "x", src: t.src, term: t.term, neg: true }); });
-  const out = cands.map(step => { const p = profile(steps.concat(step)), keep = base.n.est ? p.n.est / base.n.est : 0, from = qscore(base), to = qscore(p); return { step, keep, from, to, eff: (to - from) / Math.max(1 - keep, 0.02), n: p.n }; })
-    .filter(c => c.keep > 0.05 && c.keep < 0.995 && c.to > c.from + 0.003).sort((a, b) => b.eff - a.eff).slice(0, 8);
+  /* a step is offered when its estimate helps, and the list is ordered on what rankOf says (the worst case
+     while there is a cube): an uncertain gain is still shown, after the certain ones */
+  const out = cands.map(step => {
+    const p = profile(steps.concat(step)), keep = base.n.est ? p.n.est / base.n.est : 0, from = qscore(base), to = qscore(p);
+    const lose = p.q && base.q ? 1 - (base.q.r > 0 ? Math.min(1, p.q.r / base.q.r) : 1) : 1 - keep, per = Math.max(lose, 0.02);
+    return { step, keep, from, to, eff: (to - from) / per, rank: ((p.q ? rankOf(p).p : to) - from) / per, n: p.n };
+  }).filter(c => c.keep > 0.05 && c.keep < 0.995 && c.to > c.from + 0.003).sort((a, b) => b.rank - a.rank || b.eff - a.eff).slice(0, 8);
   PAL.sugg.set(key, out); return out;
 }
 /* which part of the step list belongs to a rail entry (for the badges) */
@@ -2185,7 +2013,7 @@ function renderPal(keepScroll) {
       else if (a.split) b.title = "One branch per value, compared side by side";
       else {
         const nextSteps = r.t && (PAL.mode === "global" || st !== "none") ? choiceSteps(steps, r.t, choice) : steps.concat(a.step), base = profile(steps), nx = profile(nextSteps);
-        b.append($("small", "", approx(nx.n.est, nx.grade === "exact") + " left")); b.append($("small", "pq", "quality " + pct(qscore(nx), 0) + " " + sgn(qscore(nx) - qscore(base))));
+        b.append($("small", "", amount(nx) + " left")); b.append($("small", "pq", "quality " + pct(qscore(nx), 0) + " " + sgn(qscore(nx) - qscore(base))));
         b.title = pct(base.n.est ? nx.n.est / base.n.est : 0, 0) + " of the tickets now in view stay · quality " + pct(qscore(base), 0) + " → " + pct(qscore(nx), 0) + (st === "exc" && choice === "include" ? " · stops ignoring it" : "");
       }
       b.onclick = ev => { if (!b.disabled) rowAct(r, a, ev.shiftKey); }; acts.append(b);
@@ -2228,7 +2056,7 @@ def render(report: dict) -> str:
     data = json.dumps(report, ensure_ascii=False, allow_nan=False)
     data = data.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     data = data.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    return _PAGE.replace("__CSP__", _CSP).replace("__DATA__", data)
+    return _PAGE.replace("__MODEL__", _MODEL).replace("__CSP__", _CSP).replace("__DATA__", data)
 
 
 def main(argv: list[str] | None = None) -> int:

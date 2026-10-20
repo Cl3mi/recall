@@ -10,7 +10,7 @@ export PG_DSN
 RECALL_PG_DSN ?= $(PG_DSN)
 export RECALL_PG_DSN
 
-.PHONY: db-up db-down db-reset migrate test lint local-dirs check-clean window-a-rehearsal window-b-rehearsal window-d-rehearsal guard-install guard-test
+.PHONY: db-up db-down db-reset migrate test lint local-dirs check-clean window-a-rehearsal window-b-rehearsal window-d-rehearsal guard-install guard-test publish
 
 local-dirs:
 	mkdir -p local/artifacts local/fixtures local/quarantine
@@ -56,6 +56,11 @@ window-d-rehearsal:
 
 guard-install:
 	git config core.hooksPath .githooks
+
+# Snapshot of HEAD to the private GitHub repo: allowlisted paths only, scanned against
+# local/publish-denylist.txt. Never `git push` - local history holds NDA-sensitive material.
+publish:
+	bash tools/publish/publish.sh
 
 # Needs the project venv (uv run): the tests import the `recall` package, not just stdlib.
 guard-test:

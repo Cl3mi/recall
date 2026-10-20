@@ -8,12 +8,14 @@ import copy
 from insight import (
     concentration,
     crosstab,
+    cube,
     dimensions,
     extract,
     formats,
     guard,
     lifecycle,
     origin,
+    quality,
     readiness,
     release,
     texts,
@@ -69,6 +71,7 @@ def build(
     provenance: dict,
     k: int = release.K,
     serial_prefixes: bool = False,
+    cube_budget: float = cube.BUDGET,
 ) -> dict:
     # Checked and copied first. The report must not alias the caller's dicts (mutating them
     # after the guard ran would change a "guarded" report), and the caller must not be able to
@@ -80,6 +83,18 @@ def build(
     if source["row_count"] != len(rows):
         raise ValueError("source.row_count does not match the rows")
     tickets = extract.tickets(rows)
+    graded = quality.grades(tickets, k)
+    origin_section = {
+        "baugruppe": origin.baugruppe(tickets, k),
+        "vehicles": origin.vehicles(tickets, k, serial_prefixes),
+        "titles": origin.titles(tickets, k),
+        "baugruppe_model_year": crosstab.baugruppe_model_year(tickets, k),
+    }
+    quality_section = quality.build(tickets, k, graded)
+    quality_section["cube"] = cube.build(tickets, graded, quality_section["by_dimension"], k)
+    quality_section["cube"]["measurement"] = cube.measure(
+        tickets, quality_section, origin_section, k, cube_budget
+    )
     built = {
         "schema_version": SCHEMA_VERSION,
         "source": copy.deepcopy(source),
@@ -89,12 +104,7 @@ def build(
             "min_frequency": k,
             "serial_prefixes_enabled": serial_prefixes,
         },
-        "origin": {
-            "baugruppe": origin.baugruppe(tickets, k),
-            "vehicles": origin.vehicles(tickets, k, serial_prefixes),
-            "titles": origin.titles(tickets, k),
-            "baugruppe_model_year": crosstab.baugruppe_model_year(tickets, k),
-        },
+        "origin": origin_section,
         "text": texts.build(tickets, k),
         "formats": formats.build(tickets, k),
         "timeline": timeline.build(tickets, k),
@@ -103,6 +113,7 @@ def build(
         "concentration": concentration.build(tickets, k),
         "vocabulary": vocabulary.build(tickets, k),
         "readiness": readiness.build(tickets, k),
+        "quality": quality_section,
     }
     built["suppression"] = _suppression(built)
     built["selfcheck"] = {"passed": False}
