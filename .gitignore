@@ -1,0 +1,58 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+node_modules/
+.env
+
+# ---------------------------------------------------------------------------
+# Data safety: NO data file of any kind is committed - real or synthetic.
+# Fixtures are regenerated from a committed generator + seed, never stored here.
+# The only exception is the checksum manifest, which contains no data itself.
+# ---------------------------------------------------------------------------
+local/
+!local/MANIFEST.sha256
+
+*.csv
+*.tsv
+*.parquet
+*.npy
+*.npz
+*.pkl
+*.jsonl
+profile.json
+profile_report.md
+eval_real.json
+*.syn
+data/
+quarantine/
+
+# profiler/data/ holds PUBLIC reference data (a common-surname list), not corpus
+# data. `data/` above would otherwise silently exclude it, and entities.py reads
+# that file at import time - so a fresh clone would crash on FileNotFoundError.
+# tests/unit/test_entities.py asserts it is actually tracked.
+!profiler/data/
+
+# Case variants - gitignore matching is case-sensitive on Linux, and a Windows
+# or Excel re-export arrives as .CSV or .Csv.
+*.[cC][sS][vV]
+*.[tT][sS][vV]
+
+# Spreadsheet and archive shapes - how a 65k-row export actually travels.
+*.xls
+*.xlsx
+*.xlsm
+*.ods
+*.zip
+*.gz
+*.7z
+
+# Personal, machine-local settings - not shared project config.
+.claude/settings.local.json
+
+# Isolated git worktrees for feature work.
+.worktrees/
+
+# Per-person guard settings (extra allowed / protected paths)
+.claude/guard.local.json

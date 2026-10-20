@@ -1,0 +1,69 @@
+[project]
+name = "recall"
+version = "0.1.0"
+description = "Ticket similarity search (Lösungsfinder)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "httpx>=0.28",
+  "numpy>=2.1",
+  "jsonschema>=4.23",
+  "datasketch>=1.6",
+  "selectolax>=0.3",
+  "torch>=2.4",
+  "transformers>=4.44",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-cov>=6.0", "ruff>=0.8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+  "needs_pg: requires the Postgres container (make db-up)",
+  "needs_gpu: requires the H100 box via gpu-fairuse2.sh",
+  "needs_model: requires the e5 weights (skipped unless they are present locally)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# docs/ holds Markdown whose fenced code blocks ruff would reformat.
+# .claude/ is harness config; several entries there are character devices that
+# cannot be read at all, so ruff errors rather than skipping them.
+extend-exclude = ["docs", ".claude"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recall", "profiler", "fixtures", "insight"]
+
+# CUDA build, by operator decision 2026-09-11, REVERSING the 2026-09-07 CPU-only ruling.
+# That earlier decision was right while the gate's cost was unmeasured; once measured it was
+# ~2.2 h of CPU embedding per window (finding 17), against minutes on an H100. The trade
+# accepted alongside it: the sealed image roughly doubles, so `window.sh ship` goes from ~25
+# to ~50 min at the measured link speed.
+#
+# cu126 specifically, and not by preference: it is the ONLY index carrying torch 2.14.0 -
+# cu124 and cu128 have no 2.14 build at all. The box's driver is 550.163.01, older than
+# CUDA 12.6's own toolkit requirement, which is fine because PyTorch's cu12x wheels bundle
+# their runtime and need only driver >= 525.60.13 (minor version compatibility). Verified on
+# the box that CDI GPU injection works there under --network=none.
+#
+# `explicit = true` keeps every other package on PyPI - without it uv would try to resolve
+# the whole tree against download.pytorch.org.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }

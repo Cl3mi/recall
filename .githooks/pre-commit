@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# Rejects staged data files and new code that writes outputs or logs outside recall.sealed.
+# Enable once per clone with: make guard-install
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "recall guard pre-commit: python3 not found on PATH, cannot lint staged files (commit blocked)" >&2
+    exit 1
+fi
+root="$(git rev-parse --show-toplevel)"
+exec python3 "$root/tools/guard/guard.py" --lint-staged

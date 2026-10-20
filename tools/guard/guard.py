@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""PreToolUse hook entry for the recall client-data guard (stdlib only)."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from recall_guard.core import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
