@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "recall ticket corpus profile",
+  "type": "object",
+  "required": ["schema_version", "source", "per_field", "null_mask_patterns",
+               "identifier_grammars", "custom_data", "discovered_identifier_shapes",
+               "solutions", "clusters", "vocabulary", "selfcheck"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "2"},
+    "source": {
+      "type": "object",
+      "required": ["filename", "sha256", "bytes", "row_count", "columns_found"],
+      "properties": {
+        "filename": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "row_count": {"type": "integer", "minimum": 0},
+        "encoding_detected": {"type": "string"},
+        "delimiter": {"type": "string", "maxLength": 1},
+        "columns_found": {"type": "array", "items": {"type": "string"}},
+        "columns_expected_missing": {"type": "array", "items": {"type": "string"}},
+        "columns_unexpected": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "per_field": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["present_count", "null_count", "empty_string_count"],
+        "properties": {
+          "present_count": {"type": "integer"},
+          "null_count": {"type": "integer"},
+          "empty_string_count": {"type": "integer"},
+          "distinct_count_estimate": {"type": "integer"},
+          "char_len_quantiles": {"$ref": "#/$defs/quantiles"},
+          "token_len_quantiles": {"$ref": "#/$defs/quantiles"},
+          "cleaned_char_len_quantiles": {"$ref": "#/$defs/quantiles"},
+          "cleaned_token_len_quantiles": {"$ref": "#/$defs/quantiles"},
+          "all_caps_rate": {"$ref": "#/$defs/rate"},
+          "no_punctuation_rate": {"$ref": "#/$defs/rate"},
+          "html_rate": {"$ref": "#/$defs/rate"},
+          "quoted_chain_rate": {"$ref": "#/$defs/rate"},
+          "signature_rate": {"$ref": "#/$defs/rate"},
+          "diag_dump_rate": {"$ref": "#/$defs/rate"},
+          "top_values": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["value", "count"],
+              "properties": {"value": {"type": "string"}, "count": {"type": "integer"}}
+            }
+          }
+        }
+      }
+    },
+    "null_mask_patterns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["columns_null", "count", "share"],
+        "properties": {
+          "columns_null": {"type": "array", "items": {"type": "string"}},
+          "count": {"type": "integer"},
+          "share": {"$ref": "#/$defs/rate"}
+        }
+      }
+    },
+    "identifier_grammars": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "regex", "count", "share"],
+        "properties": {
+          "kind": {"enum": ["error_code", "part_number", "serial_number",
+                            "model_designation", "measurement", "other"]},
+          "regex": {"type": "string"},
+          "shape": {"$ref": "#/$defs/shape"},
+          "charset": {"type": "string"},
+          "count": {"type": "integer"},
+          "share": {"$ref": "#/$defs/rate"}
+        }
+      }
+    },
+    "model_designations": {
+      "type": "object",
+      "properties": {
+        "grammar": {"type": "array", "items": {"type": "string"}},
+        "inferred_family_rule": {"type": "string"},
+        "family_count": {"type": "integer"},
+        "models_per_family_quantiles": {"$ref": "#/$defs/quantiles"}
+      }
+    },
+    "dimension_hints": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id", "count"],
+          "properties": {
+            "id": {"type": ["string", "integer", "null"]},
+            "count": {"type": "integer"},
+            "top_tokens": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "temporal": {
+      "type": "object",
+      "properties": {
+        "created_per_month": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "age_years_quantiles": {"$ref": "#/$defs/quantiles"},
+        "fill_by_month": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {"$ref": "#/$defs/rate"}
+          }
+        }
+      }
+    },
+    "solutions": {
+      "type": "object",
+      "required": ["fill_rate", "nonempty_after_clean_rate", "cardinality",
+                   "junk_taxonomy", "usable_rate_estimate"],
+      "properties": {
+        "fill_rate": {"$ref": "#/$defs/rate"},
+        "nonempty_after_clean_rate": {"$ref": "#/$defs/rate"},
+        "cardinality": {
+          "type": "object",
+          "required": ["single_field"],
+          "properties": {
+            "single_field": {"type": "boolean"},
+            "detected_separator": {"type": ["string", "null"]},
+            "entries_per_ticket_quantiles": {"$ref": "#/$defs/quantiles"}
+          }
+        },
+        "junk_taxonomy": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pattern", "count", "share"],
+            "properties": {
+              "pattern": {"type": "string"},
+              "count": {"type": "integer"},
+              "share": {"$ref": "#/$defs/rate"}
+            }
+          }
+        },
+        "usable_rate_estimate": {"$ref": "#/$defs/rate"},
+        "token_len_quantiles": {"$ref": "#/$defs/quantiles"}
+      }
+    },
+    "clusters": {
+      "type": "object",
+      "required": ["method", "threshold", "cluster_count", "singleton_count", "size_distribution"],
+      "properties": {
+        "method": {"type": "string"},
+        "threshold": {"type": "number"},
+        "cluster_count": {"type": "integer"},
+        "singleton_count": {"type": "integer"},
+        "size_distribution": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "size_quantiles": {"$ref": "#/$defs/quantiles"},
+        "zipf_alpha_estimate": {"type": ["number", "null"]},
+        "largest": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["size", "share"],
+            "properties": {
+              "size": {"type": "integer"},
+              "share": {"$ref": "#/$defs/rate"},
+              "top_tokens": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "clusters_omitted": {"type": "integer"}
+      }
+    },
+    "vocabulary": {
+      "type": "object",
+      "required": ["total_tokens", "distinct_tokens", "min_frequency_threshold", "top_tokens"],
+      "properties": {
+        "total_tokens": {"type": "integer"},
+        "distinct_tokens": {"type": "integer"},
+        "min_frequency_threshold": {"type": "integer", "minimum": 2},
+        "top_tokens": {"$ref": "#/$defs/token_counts"},
+        "top_bigrams": {"$ref": "#/$defs/token_counts"},
+        "hunspell_unrecognized_top": {"$ref": "#/$defs/token_counts"}
+      }
+    },
+    "multi_fault_estimate": {
+      "type": "object",
+      "properties": {
+        "heuristic": {"type": "string"},
+        "rate": {"$ref": "#/$defs/rate"}
+      }
+    },
+    "custom_data": {
+      "type": "object",
+      "required": ["format", "parse_success_rate", "keys"],
+      "properties": {
+        "format": {"enum": ["json", "key_value", "unknown"]},
+        "parse_success_rate": {"$ref": "#/$defs/rate"},
+        "keys_per_row_quantiles": {"$ref": "#/$defs/quantiles"},
+        "distinct_key_count": {"type": "integer"},
+        "keys_suppressed": {"type": "integer"},
+        "keys_omitted_over_cap": {"type": "integer"},
+        "envelope": {
+          "type": "object",
+          "required": ["detected"],
+          "properties": {
+            "detected": {"type": "boolean"},
+            "name_attribute": {"type": ["string", "null"]},
+            "distinct_field_count": {"type": "integer"},
+            "fields_suppressed": {"type": "integer"},
+            "fields_omitted_over_cap": {"type": "integer"},
+            "records_per_row_quantiles": {"$ref": "#/$defs/quantiles"},
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "kind"],
+                "properties": {
+                  "name": {"type": "string"},
+                  "present_count": {"type": "integer"},
+                  "fill_rate": {"$ref": "#/$defs/rate"},
+                  "kind": {
+                    "enum": ["empty", "numeric", "identifier_like", "prose", "short_text"]
+                  },
+                  "value_char_len_quantiles": {"$ref": "#/$defs/quantiles"},
+                  "value_shapes": {"$ref": "#/$defs/shape_counts"},
+                  "shapes_suppressed": {"type": "integer"},
+                  "long_value_count": {"type": "integer"}
+                }
+              }
+            }
+          }
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "kind", "fill_rate"],
+            "properties": {
+              "key": {"type": "string"},
+              "present_count": {"type": "integer"},
+              "fill_rate": {"$ref": "#/$defs/rate"},
+              "kind": {"enum": ["empty", "numeric", "identifier_like", "prose", "short_text"]},
+              "value_char_len_quantiles": {"$ref": "#/$defs/quantiles"},
+              "value_shapes": {"$ref": "#/$defs/shape_counts"},
+              "shapes_suppressed": {"type": "integer"},
+              "long_value_count": {"type": "integer"}
+            }
+          }
+        }
+      }
+    },
+    "discovered_identifier_shapes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["shape", "count", "share"],
+        "properties": {
+          "shape": {"$ref": "#/$defs/shape"},
+          "count": {"type": "integer"},
+          "share": {"$ref": "#/$defs/rate"},
+          "fields": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "discovered_identifier_shapes_omitted": {"type": "integer"},
+    "selfcheck": {
+      "type": "object",
+      "required": ["passed", "checks"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "checks": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "rate": {"type": "number", "minimum": 0, "maximum": 1},
+    "shape": {"type": "string", "pattern": "^[ALaD_\\-./:#]{1,16}$"},
+    "shape_counts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["shape", "count"],
+        "properties": {
+          "shape": {"$ref": "#/$defs/shape"},
+          "count": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "quantiles": {
+      "type": "object",
+      "additionalProperties": {"type": "number"},
+      "required": ["p50", "p95", "max"]
+    },
+    "token_counts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["token", "count"],
+        "properties": {"token": {"type": "string"}, "count": {"type": "integer", "minimum": 2}}
+      }
+    }
+  }
+}

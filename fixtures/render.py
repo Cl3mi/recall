@@ -17,7 +17,7 @@ def custom_data(fields: list[tuple[str, str]]) -> str:
     """The client's customData encoding: descriptors, serialised twice.
 
     json.dumps of a json.dumps, so the CSV field opens with a quote and a single
-    json.loads returns a string rather than a container. Round 2 parsed 0% of 16,053
+    json.loads returns a string rather than a container. Round 2 parsed none of the
     real values because nothing rehearsed this.
     """
     records = [
