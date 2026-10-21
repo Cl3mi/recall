@@ -56,7 +56,7 @@ def build_standin(
             # on row 400, which is also a malformed row - the only row carrying this key
             # would never parse, and the below-the-floor case would go untested.
             if i % 400 == 7:
-                custom["sonderfall_standort"] = "Wattens"  # below the presence floor
+                custom["sonderfall_standort"] = "Beispielstadt"  # below the presence floor
             if i % 3 == 0:
                 custom["huber_sonderfeld"] = "1"  # entity-named key, suppressed
             # Wrapped the way the real export wraps it: a list of field DESCRIPTORS,

@@ -1,6 +1,10 @@
 # Paths that may leave the machine, as a snapshot of HEAD (git archive), never as history.
 # Everything not listed here stays local. Add a path only after it has been scrubbed of the
-# client name, real-corpus figures, host aliases and absolute paths (see tools/publish/publish.sh).
+# client name, real-corpus figures, host account names and absolute paths (see
+# tools/publish/publish.sh, which also scans against a local denylist before pushing).
+#
+# Deliberately NOT listed: docs/client-questions.md (client-facing questions and process gaps),
+# docs/export.header.txt and docs/csv-safeguard-implementation.md (local working files), local/.
 src
 tools
 tests/__init__.py
@@ -9,10 +13,17 @@ tests/guard
 fixtures
 profiler
 insight
+infra
 .githooks
+.claude/settings.json
 Makefile
 pyproject.toml
 uv.lock
 README.md
 CLAUDE.md
 .gitignore
+PROJECT_BRIEF.md
+docs/STATE.md
+docs/airlock-runbook.md
+docs/NEXT-SESSION-PROMPT.md
+docs/superpowers

@@ -1,0 +1,23 @@
+name: recall
+services:
+  db:
+    build: .
+    image: recall/postgres:18
+    environment:
+      POSTGRES_DB: recall
+      POSTGRES_USER: recall
+      POSTGRES_PASSWORD: recall_dev_only
+    ports: ["5433:5432"]
+    volumes: ["pgdata:/var/lib/postgresql"]
+    # Without this the dev database does not come back after a reboot, and the next
+    # `make test` fails with ten psycopg connection errors that read like code defects
+    # rather than "the container is not running". unless-stopped, not always, so an
+    # explicit `make db-down` stays down.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recall -d recall"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  pgdata:

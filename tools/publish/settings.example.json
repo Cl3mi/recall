@@ -1,0 +1,74 @@
+{
+  "_comment": "Template for .claude/settings.json. Replace <path-to-export-dir> with the directory that holds the real ticket export on THIS machine (and add any other location it could land in), then copy to .claude/settings.json and run `make guard-install`. The real settings file stays out of the published repo because it names that directory.",
+  "permissions": {
+    "deny": [
+      "Read(./local/quarantine/**)",
+      "Read(//data/recall-quarantine/**)",
+      "Read(//<path-to-export-dir>/**)",
+      "Read(**/*.syn)",
+      "Read(**/*.csv)",
+      "Read(**/*.tsv)",
+      "Read(**/*.parquet)",
+      "Read(**/*.jsonl)",
+      "Read(./local/sealed/**)",
+      "Bash(cat ./local/quarantine/*)",
+      "Bash(head ./local/quarantine/*)",
+      "Bash(tail ./local/quarantine/*)",
+      "Bash(less ./local/quarantine/*)",
+      "Bash(grep * ./local/quarantine/*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/tools/guard/run-guard.sh",
+            "timeout": 10,
+            "statusMessage": "recall guard"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/tools/guard/run-guard.sh --selfcheck",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "sandbox": {
+    "enabled": false,
+    "filesystem": {
+      "denyRead": [
+        "./local/quarantine",
+        "./local/sealed",
+        "/data/recall-quarantine",
+        "<path-to-export-dir>"
+      ],
+      "denyWrite": [
+        "./tools/guard",
+        "./.claude/settings.json",
+        "./.githooks"
+      ],
+      "allowWrite": [
+        "~/.cache/uv"
+      ]
+    },
+    "network": {
+      "allowLocalBinding": true,
+      "allowAllUnixSockets": true,
+      "allowedDomains": [
+        "localhost",
+        "127.0.0.1"
+      ]
+    }
+  }
+}
