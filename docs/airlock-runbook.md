@@ -381,6 +381,184 @@ Abort, shred (`infra/profiler/window.sh --window d clean`), and only then ask fo
 paste any output of a sealed run that you have not read yourself first; the printed codes and
 counts are safe, the detail log is not.
 
+## Window E — catalog extraction (problem catalog from the real export)  🔒 AI OFF from here
+
+**What it is.** A local language model reads clusters of real tickets and drafts one "recipe" per
+recurring problem (a cause, a component, a remedy, written in general words). The draft is checked
+by machine against the whole export, and **then by you**. What may leave the box is exactly two
+files: `catalog.json` (the released recipes) and `catalog.leak_report.json` (the machine check that
+vouches for them). The draft, the export and every log stay on the box and are shredded.
+
+**Why a human reads every word.** The machine checks (below) catch names, rare words and copied
+sentences. They cannot judge whether a recipe *reads like a particular customer's ticket*. You can.
+The catalog is meant to be readable by an AI afterwards, so anything you let through is gone.
+
+### Before the window (AI assistance fine, no real data present)
+
+- [ ] `make window-e-rehearsal` → `0 failed`. It runs the real `window.sh` against a stub model on a
+      workstation. It does **not** prove the vLLM image or the GPU (see "First-run things" below).
+- [ ] **The image changed** (the catalog code is baked into it), so ship it again:
+      `infra/profiler/window.sh --window e ship`. Look for these lines, all `ok`:
+      `offline import works on the box` (it now imports the catalog CLI),
+      `German dictionary present in the image`,
+      `podman can create an internal network on the box`,
+      `LLM image present on the box`. If the internal-network line says ABORT, stop: see
+      "If it fails". A plain (non-internal) network would give the model server a route out.
+- [ ] `RECALL_WINDOW_LLM_IMAGE` is set to the vLLM image **pinned by digest**, e.g.
+      `export RECALL_WINDOW_LLM_IMAGE=docker.io/vllm/vllm-openai@sha256:<digest>`. A floating tag
+      (`:latest`) is not acceptable: the model server must be the one you checked. The image must
+      already be loaded on the box; the window has no network and cannot pull it.
+- [ ] `RECALL_WINDOW_HF_CACHE` is set to the directory on the box that holds the model weights
+      (`Qwen/Qwen2.5-32B-Instruct-AWQ`, about 20 GB). Weights are not data. The window runs offline,
+      so the weights must already be there.
+- [ ] Also exported: `RECALL_WINDOW_QUARANTINE=<data-dir>/recall-quarantine` (as for the other windows).
+- [ ] GPU: the run claims GPU 0 through `gpu-fairuse2.sh` and pins it by UUID. If it says
+      "fairuse refused", the card is busy: **wait**, do not crowd the box. The model is sized to
+      stay under the shared 60 GB cap (`--gpu-memory-utilization 0.70`).
+- [ ] **The export is on the box:**
+      `infra/profiler/window.sh --window e --csv /path/to/the/export.csv push`
+      (the preflight prints shape only). `make check-clean` on the workstation afterwards, unsandboxed.
+- [ ] Run `infra/profiler/window.sh --window e run --dry-run` and read the script it prints. It must
+      show: `podman network create --internal`, **no `-p` or `--publish` anywhere**, the model
+      container with `--log-driver=none`, `--no-enable-log-requests`, a weights mount ending
+      `:ro` and **no `/q` mount**, `--network=none` on the last container, and neither
+      `--allow-weak-floor` nor any floor flag. If any of that is missing, stop.
+
+### The window
+
+- [ ] `infra/profiler/window.sh --window e run`   (`all` does ship + push + run + verify in one go and
+      then stops; use it only if you want the image shipped again)
+
+  What the box is doing, so you can tell it is healthy:
+  1. It claims the GPU and creates a private network that has **no route out** (`--internal`).
+  2. It starts the model server on that network. This container mounts **nothing from quarantine**
+     and its logs are discarded, so ticket text reaches it only over the private network and lives
+     only in memory.
+  3. It polls the model server every 10 seconds, for up to 30 minutes, until it answers. Loading the
+     model takes minutes; silence here is normal.
+  4. It runs `catalog build` (cluster the tickets, ask the model for one recipe per cluster, check each
+     one) and writes `catalog.draft.json`. This can take tens of minutes to a couple of hours.
+  5. It **stops and removes the model server and the network** (also when anything above fails, on
+     every exit). The GPU is freed.
+  6. It runs `catalog leakcheck` with **no network at all** and writes `catalog.leak_report.json`.
+
+  Stdout ends with `leakcheck tickets=<n> identity_tokens=<n> passed=True`. Exit codes of the catalog
+  commands: `0` fine, `2` the leak check or release gate refused (the code and a schema path are safe
+  to read), `3` unexpected failure, `4` wrong arguments or input.
+- [ ] `infra/profiler/window.sh --window e verify` prints **counts and verdicts only**. Read it like this:
+      - `recipes in draft` must be above 0. **0 means the build produced nothing:** the window is
+        spent and the fix is in code, not here. Shred and stop.
+      - every `check ... ok failures=0`. The four checks are `vocabulary_floor` (a word in a recipe
+        that too few tickets, dealers or vehicles use), `identity_denylist` (a recipe word that is, or
+        contains, something from a name, number or serial column), `verbatim_corpus` (five words in a
+        row copied from any ticket) and `guard` (the structural rules of a recipe).
+      - `report passed : True`.
+      - `report matches draft : True`. **False means the draft changed after the check** (see below).
+- [ ] **WHAT TO READ ON THE BOX: the whole draft and the whole leak report. Every recipe, every word.**
+
+      ssh hpc 'less <data-dir>/recall-quarantine/catalog.draft.json'
+      ssh hpc 'less <data-dir>/recall-quarantine/catalog.leak_report.json'
+
+      The machine passing is **not** the review. For every recipe, ask whether it contains:
+      - a surname or any person's name, or a first name
+      - a dealer or a customer, or anything that points to one (a town used as a dealer's name)
+      - a product-internal name, project name or tool name that only this company uses
+      - a part number, serial number, ticket number, code or any identifier
+      - a place, a plant or a site
+      - a sentence that reads like a real ticket (a particular story, a date, "we called him on...")
+      - anything that could identify a person or a company
+      - anything you would not want a competitor to read
+
+      **Any doubt means delete the recipe or edit it.** There is no cost to dropping a recipe worth
+      doubting; a leaked name costs the whole release. To edit, change the draft on the box with an
+      editor. **Any edit, even one comma, invalidates the report** (it is bound to the exact bytes of the
+      draft), so run the check again:
+
+      infra/profiler/window.sh --window e leakcheck
+      infra/profiler/window.sh --window e verify      # report matches draft : True
+
+      Then read the changed recipes again.
+- [ ] `infra/profiler/window.sh --window e release` writes `catalog.json`, with no network, and
+      **only if** the report passed for the exact draft. It refuses otherwise (see "If it fails").
+- [ ] `infra/profiler/window.sh --window e fetch --clean` copies back **only** `catalog.json` and
+      `catalog.leak_report.json` to `local/artifacts/` (after asking whether you read both draft and
+      report), then shreds the export, the draft, every `*.tmp` and the detail log.
+- [ ] `ssh hpc 'ls -la <data-dir>/recall-quarantine'` → only `catalog.json` and
+      `catalog.leak_report.json` remain (plus `.sealed`, a one-line marker file that is meant to stay).
+- [ ] `make check-clean` on the workstation → quarantine empty. **Run it unsandboxed**, in a normal
+      terminal; under the Claude Code sandbox it cannot list the denied directory and reports a false
+      `clean`.
+- [ ] 🔓 Only now resume AI-assisted work.
+
+Note: `run` first deletes any old `catalog.draft.json`, `catalog.leak_report.json` and `catalog.json`
+in quarantine, so a failed run cannot leave the previous run's report or catalog to be fetched.
+
+### First-run things to verify on the box (the rehearsal cannot)
+
+The rehearsal replaces the model server with a stub, so two things are untested until the first real run.
+If either fails, the window is spent on diagnosis, but **nothing leaks**: only the model container fails.
+
+1. **The vLLM image's entrypoint and arguments.** The window starts the image as
+   `<image> --model Qwen/Qwen2.5-32B-Instruct-AWQ --no-enable-log-requests --gpu-memory-utilization 0.70
+   --max-model-len 32768 --host 0.0.0.0 --port 8000`. That is the form of the OpenAI-compatible
+   `vllm/vllm-openai` image, whose entrypoint is the API server. If the pinned image instead needs
+   `serve <model>` or `python -m vllm.entrypoints...`, the container exits at once and the readiness
+   poll never answers. Check on the box **before** the window:
+   `podman run --rm --network=none <image> --help` must list `--model`.
+2. **The weights mount.** It is mounted **read-only** (`:ro`) with `HF_HUB_OFFLINE=1`. Two things can
+   go wrong: (a) SELinux denies the read (symptom: the container exits with "permission denied" on the
+   cache; the fix is the `:ro,Z` or `:ro,z` label on the mount), (b) the server wants to write lock
+   files into the cache (symptom: "read-only file system"; the fix is to mount it read-write, `:rw`,
+   because weights are not data). Either change is a change to `window.sh`, made **before** the window
+   and re-checked with `make window-e-rehearsal`.
+
+### If it fails
+
+First, whatever fails: the model server and the network are removed automatically. Check with
+`ssh hpc 'podman ps -a; podman network ls'` that nothing named `recall-e-...` is left; if something is,
+`podman rm -f` it and `podman network rm -f` it by hand.
+
+- **"the LLM server never answered within the readiness budget".** The container exited or the model
+  did not load in 30 minutes. Do not wait longer. Look at the container's exit with
+  `podman run` by hand for the same image (no ticket data is involved at this stage), and see the first-run
+  list above. The export is untouched; shred it if you stop here.
+- **"fairuse refused GPU 0".** The card is busy. Wait. Do not override.
+- **"podman network create --internal does not work on the box" (from `ship`).** Window E cannot be
+  isolated. **Do not run it** without an internal network, and do not replace it with a plain one.
+- **`build` printed `recipes=0`** (or `verify` says 0 recipes). Every cluster was rejected: too few
+  tickets, dealers or vehicles behind a cluster, or the model's answers did not parse. The window is
+  spent. Shred (`clean`) and fix in code, without the data.
+- **`leakcheck` failed** (exit 2, `passed=False`). The names above say which:
+  - `vocabulary_floor FAILED`: a recipe uses a word that too few tickets, dealers or vehicles used
+    (a rare word can be one person's habit or a name).
+  - `identity_denylist FAILED`: a recipe word is, or contains, a name, number or serial from the identity
+    columns. This is strict on purpose (a dealer called "Service Nord" blocks "service" and "nord").
+  - `verbatim_corpus FAILED`: five words in a row were copied from a ticket.
+  - `guard FAILED`: the recipe broke a structural rule.
+  The report lists **recipe ids only**, never words. Open the draft, find those ids, delete or rewrite the
+  recipes, run `leakcheck` again. Failures are also a good sign the model copied text: read the neighbours.
+- **`release` refused.** It prints reason codes, never a value:
+  - `STALE_REPORT $.draft_sha256`: the draft changed after the report. Run `leakcheck`, read, release.
+  - `REPORT_NOT_PASSED $.passed`: the report says the check failed. Fix the draft, `leakcheck` again.
+  - `REPORT_CHECKS`, `REPORT_SHAPE`, `REPORT_FLOORS`: the report is missing, damaged or was made with
+    weaker floors. Run `leakcheck` again (never edit the report).
+  - `GUARD_ERROR` / any other code from the draft's own path: a recipe is malformed (a hand edit broke
+    it). Fix it, `leakcheck`, release. A refused `release` leaves **no** `catalog.json`.
+- **Anything else.** Abort, `infra/profiler/window.sh --window e clean`, and describe the problem in your own
+  words. Read `profiler_detail.log` yourself, on the box; it can hold ticket text.
+
+### What NEVER to do
+
+- **Never fetch the draft.** It is the one file that holds model output derived from real text before
+  the human review. `fetch` cannot copy it, and you must not copy it by hand either.
+- **Never use `--allow-weak-floor`**, or lower `--k`, `--min-vehicles` or `--min-dealers`. They exist
+  for rehearsals only. If you ever see one in a command, stop.
+- **Never run with an AI attached** — no assistant reading the terminal, no pasted output of the
+  window. The printed codes and counts are safe; the draft and the detail log are not.
+- **Never reuse a report for an edited draft.** Any edit means `leakcheck` again, then read again.
+- Never publish a port, never replace `--internal` with a normal network, never mount quarantine into
+  the model container, never switch off `--log-driver=none`.
+
 ## Window C — real-data eval (command block written at the start of M4)
 
 Controls that must be in it, decided now:

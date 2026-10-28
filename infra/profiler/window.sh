@@ -28,6 +28,32 @@ IMAGE="${RECALL_WINDOW_IMAGE:-recall/profiler:pinned}"
 # Uncapped means all 256, which is deeper into the regime that measured worse. 32 is the best
 # of the three sampled; overridable because a quiet box can afford more.
 THREADS="${RECALL_WINDOW_THREADS:-32}"
+
+# --- Window E only: the LLM server -----------------------------------------------------------
+# Same placeholder idea as the quarantine path: neither value is in the repo (the image is pinned
+# by digest on the box, the weights live in a per-user directory), the `<` keeps --dry-run working
+# and makes a real run of window e refuse until both are set (see the check before dispatch).
+# RECALL_WINDOW_LLM_IMAGE: the vLLM image, pinned by digest (docker.io/vllm/vllm-openai@sha256:...),
+#   because a floating tag would let the model server change between the rehearsal and the window.
+# RECALL_WINDOW_HF_CACHE: host directory holding the model weights. It is mounted READ-ONLY and
+#   the server runs with HF_HUB_OFFLINE=1, so nothing is fetched and nothing is written to it.
+LLM_IMAGE="${RECALL_WINDOW_LLM_IMAGE:-<vllm-image@sha256:digest>}"
+HF_CACHE="${RECALL_WINDOW_HF_CACHE:-<hf-cache-dir>}"
+# AWQ 4-bit: the bf16 default is ~65 GB and breaches the shared 60 GB fair-use cap.
+LLM_MODEL="Qwen/Qwen2.5-32B-Instruct-AWQ"
+# 0.70 of the 80 GB card is 56 GB: under the shared 60 GB cap, with room for e5 on the same card.
+LLM_GPU_UTIL="0.70"
+LLM_MAX_LEN=32768
+# Starting points, not tuned: the real cluster-size distribution is unknown and a poor K only costs
+# a repeat window (design, open item 5).
+# RECALL_WINDOW_CLUSTERS is the tuning knob for the first real window (window e); the default is
+# unchanged. The catalog build caps the count it actually uses at eligible tickets // k.
+CLUSTERS="${RECALL_WINDOW_CLUSTERS:-300}"
+WORKERS=8
+# Model load takes minutes. Poll every 10 s for up to 30 min, then fail the whole run and tear
+# down rather than wait for ever on a window nobody is watching.
+READY_POLL_S=10
+READY_BUDGET_S=1800
 ARTIFACTS="local/artifacts"
 WINDOW=a
 CSV=""
@@ -141,7 +167,28 @@ window_contract() {
       # it never fails the run, and the report says how many cells it settled.
       WINDOW_CMD="python -m insight --csv /q/export.csv --out /q/report.json --min-frequency 50 --cube-budget 1800 --code-commit $(code_commit) --image-digest $(image_digest)"
       ;;
-    *) die "unknown window '$1' (expected a, b, c or d)" ;;
+    e)
+      WINDOW_NAME="Window E - catalog extraction"
+      WINDOW_IN="export.csv"
+      # Only the released catalog and the report that vouches for it may cross. The DRAFT never
+      # does: it is what the operator reads and edits on the box, and only `release` (which needs
+      # a passing report for those exact bytes) turns it into catalog.json.
+      WINDOW_OUT=(catalog.json catalog.leak_report.json)
+      # Two files, because the report only says the draft passed the checks; reading it without
+      # the draft would approve a catalog nobody looked at.
+      WINDOW_REVIEW="catalog.draft.json and catalog.leak_report.json"
+      # The *.tmp names: the CLI writes under a temporary name and moves it into place, so a
+      # killed run can leave a partial file behind, and a partial draft holds real text.
+      WINDOW_SHRED=(export.csv catalog.draft.json catalog.draft.json.tmp catalog.json.tmp
+                    catalog.leak_report.json.tmp profiler_detail.log)
+      # Claimed through gpu-fairuse2.sh as for window b (UUID-pinned): shared by the LLM server
+      # and the e5 embeddings in the catalog container.
+      WINDOW_GPU=0
+      # Empty on purpose: window e is not one container but two on a private network, so it has
+      # its own run path (cmd_run_e) instead of the single `podman run` of windows a-d.
+      WINDOW_CMD=''
+      ;;
+    *) die "unknown window '$1' (expected a, b, c, d or e)" ;;
   esac
 }
 
@@ -181,14 +228,19 @@ Commands
   push          preflight the export (shape only, never its content) and copy it to
                 quarantine as export.csv
   run           run this window's command on the box, sealed with --network=none
+                (window e: an LLM container and a catalog container on a private
+                internal network, torn down on any exit, then a leak check with no network)
   verify        on-box sanity checks that silently cost a cycle when wrong
-  fetch         copy back ONLY this window's allowlisted artifacts
+  leakcheck     window e only: re-run the leak check on the draft after you edited it
+  release       window e only: write catalog.json, only if the report passed for the
+                exact draft (runs with --network=none)
+  fetch        copy back ONLY this window's allowlisted artifacts
   clean         shred this window's sensitive files on the box
   status        list what is currently sitting in quarantine
   all           ship + push + run + verify, then STOP at the human review gate
 
 Options
-  --window a|b|c|d  which window (default: a)
+  --window a|b|c|d|e  which window (default: a)
   --csv PATH        the real export, for push
   --host HOST       (default: hpc, or $RECALL_WINDOW_HOST)
   --quarantine DIR  (default: $RECALL_WINDOW_QUARANTINE; required for a real run)
@@ -201,9 +253,19 @@ Options
   --dry-run         print what would run and change nothing
   --help
 
+Window E environment (a real run refuses the placeholders)
+  RECALL_WINDOW_LLM_IMAGE  the vLLM image, pinned by digest
+  RECALL_WINDOW_HF_CACHE   host directory holding the model weights (mounted read-only)
+  RECALL_WINDOW_CLUSTERS   k-means clusters requested by the catalog build (default: 300).
+                           A tuning knob for the first real window: the real cluster-size
+                           distribution is unknown. The build never uses more than
+                           eligible tickets // k clusters.
+
 The review gate
   `all` deliberately stops before fetch. Read profile_report.md on the box, then run
   `fetch --clean` yourself. Nothing is copied back until you have looked at it.
+  Window e: read catalog.draft.json AND catalog.leak_report.json in full on the box, run
+  `leakcheck` again if you edited the draft, then `release`, then `fetch --clean`.
 
 Examples
   infra/profiler/window.sh --csv ~/work/<export-dir>/<export-file> all
@@ -230,10 +292,28 @@ cmd_ship() {
   fi
   ok "image loaded on $HOST"
 
-  remote "podman run --rm --network=none $IMAGE python -c 'import profiler.__main__, profiler.blessing, insight.__main__'" \
+  # Window e adds the catalog CLI to the image, so its import is proved here too - a missing
+  # module found inside the window would cost the whole window.
+  local import_line="import profiler.__main__, profiler.blessing, insight.__main__"
+  [[ "$WINDOW" == e ]] && import_line+=", catalog.__main__"
+  remote "podman run --rm --network=none $IMAGE python -c '$import_line'" \
     && ok "offline import works on the box" || die "the image cannot import offline on the box"
   remote "podman run --rm --network=none $IMAGE hunspell -d de_DE -l </dev/null" \
     && ok "German dictionary present in the image" || die "hunspell/de_DE missing on the box"
+
+  if [[ "$WINDOW" == e ]]; then
+    # The private network is the whole isolation story for the two-container window, so prove on
+    # the box that this podman can make an INTERNAL one (design, open item 2) - a plain network
+    # would silently give the LLM and catalog containers a route out. Create and remove a probe.
+    remote "podman network create --internal recall-e-probe-\$\$ >/dev/null && podman network rm recall-e-probe-\$\$ >/dev/null" \
+      && ok "podman can create an internal network on the box" \
+      || die "podman network create --internal does not work on the box - window e cannot be isolated"
+    # The LLM image is pinned and is NOT shipped by this script, so a typo or a missing load is
+    # found here, before the window, rather than as a pull attempt (which has no network) inside it.
+    remote "podman image exists $LLM_IMAGE" \
+      && ok "LLM image present on the box" \
+      || die "LLM image $LLM_IMAGE is not on the box - load it there first"
+  fi
 
   remote "mkdir -p $QUARANTINE && chmod 700 $QUARANTINE"
   ok "quarantine ready at $QUARANTINE (mode 700)"
@@ -271,7 +351,7 @@ cmd_push() {
 
 cmd_run() {
   bold "$WINDOW_NAME  (AI OFF from here)"
-  [[ -n "$WINDOW_CMD" ]] ||
+  [[ -n "$WINDOW_CMD" || "$WINDOW" == e ]] ||
     die "window '$WINDOW' has no command block yet - it is written at the start of its milestone"
 
   # The box must not be crowded. Exit 1 means wait; exit 3 means unreachable, which is a
@@ -302,6 +382,13 @@ cmd_run() {
     info "dry-run: would claim GPU $WINDOW_GPU through gpu-fairuse2.sh"
   fi
 
+  # Window e has two containers and a network to tear down, so it does not use the single
+  # `podman run` below. The GPU claim above is shared: one card, one UUID, for both containers.
+  if [[ "$WINDOW" == e ]]; then
+    cmd_run_e "$device_arg"
+    return 0
+  fi
+
   # ulimit -c 0 is a data-safety control, not tidiness: a core dump written on the box
   # would contain ticket text straight out of memory, and it would outlive the window.
   # --network=none is the actual guarantee that nothing phones home.
@@ -330,9 +417,132 @@ cmd_run() {
   ok "sealed run completed"
 }
 
+# A catalog container with NO network: used for leakcheck and release, which need real rows or
+# the draft but never the LLM. --network=none is the actual guarantee that nothing phones home;
+# --ulimit core=0 is the container-side twin of the shell's ulimit -c 0 (a core dump would hold
+# ticket text). The sealed root is the quarantine mount, so every output name is relative to it
+# and goes through recall.sealed. $1 is the catalog subcommand and its arguments.
+catalog_sealed() {
+  printf '%s' "podman run --rm --network=none --ulimit core=0 -v $QUARANTINE:/q -e RECALL_SEALED_ROOT=/q -e RECALL_PROFILER_DETAIL_LOG=/q/profiler_detail.log $IMAGE python -m catalog $1"
+}
+# No floor flag is ever passed: the CLI defaults ARE the release floors, and --allow-weak-floor
+# is for rehearsals only.
+leakcheck_args() { printf '%s' "leakcheck --csv /q/$WINDOW_IN --draft catalog.draft.json --out catalog.leak_report.json"; }
+release_args()   { printf '%s' "release --draft catalog.draft.json --report catalog.leak_report.json --out catalog.json"; }
+
+# Window e: LLM server + catalog build on a private internal network, then a leak check with no
+# network. ONE remote script, so the teardown trap lives in the same shell as everything it must
+# clean up - separate ssh calls would leave a failed run's model server and network behind.
+cmd_run_e() {
+  local device_arg="$1"
+  local tries=$(( READY_BUDGET_S / READY_POLL_S ))
+  local script
+  script="$(cat <<EOF
+set -e
+NET=recall-e-\$\$
+LLM=recall-e-llm-\$\$
+teardown() {
+  podman stop -t 10 \$LLM >/dev/null 2>&1 || true
+  podman rm -f \$LLM >/dev/null 2>&1 || true
+  podman network rm -f \$NET >/dev/null 2>&1 || true
+}
+trap teardown EXIT
+trap 'exit 1' HUP INT TERM
+ulimit -c 0
+rm -f $QUARANTINE/catalog.draft.json $QUARANTINE/catalog.leak_report.json $QUARANTINE/catalog.json
+podman network create --internal \$NET >/dev/null
+podman run -d --rm --name \$LLM --network \$NET --network-alias llm $device_arg --ipc=host \
+  -v $HF_CACHE:/root/.cache/huggingface:ro -e HF_HUB_OFFLINE=1 --ulimit core=0 --log-driver=none \
+  $LLM_IMAGE --model $LLM_MODEL --no-enable-log-requests --gpu-memory-utilization $LLM_GPU_UTIL \
+  --max-model-len $LLM_MAX_LEN --host 0.0.0.0 --port 8000 >/dev/null
+READY=0
+N=0
+while [ \$N -lt $tries ]; do
+  if podman run --rm --network \$NET --ulimit core=0 $IMAGE python -c "import httpx; httpx.get('http://llm:8000/v1/models', timeout=5).raise_for_status()" >/dev/null 2>&1; then READY=1; break; fi
+  sleep $READY_POLL_S
+  N=\$((N + 1))
+done
+[ \$READY = 1 ] || { echo 'the LLM server never answered within the readiness budget' >&2; exit 1; }
+T=$THREADS
+C=\$(nproc)
+if [ "\$T" -gt "\$C" ]; then T=\$C; fi
+podman run --rm --network \$NET $device_arg --cpus \$T -e OMP_NUM_THREADS=\$T -e MKL_NUM_THREADS=\$T --ulimit core=0 \
+  -v $QUARANTINE:/q -e RECALL_SEALED_ROOT=/q -e RECALL_PROFILER_DETAIL_LOG=/q/profiler_detail.log \
+  $IMAGE python -m catalog build --csv /q/$WINDOW_IN --draft catalog.draft.json --embedder e5 \
+  --llm vllm --base-url http://llm:8000 --model $LLM_MODEL --workers $WORKERS --clusters $CLUSTERS
+teardown
+$(catalog_sealed "$(leakcheck_args)")
+EOF
+)"
+
+  # What each control is for:
+  # - trap before anything is created: a failed run must never leave a model server holding GPU
+  #   memory, or a network, behind - and nobody is watching an unattended window to clean up.
+  # - --internal: containers on it reach each other by name and nothing else. No -p anywhere, so
+  #   the LLM server is unreachable from outside the box.
+  # - the LLM container mounts nothing from quarantine and has --log-driver=none, so real text
+  #   reaches it only over the network, lives only in memory, and its stdout is discarded;
+  #   --no-enable-log-requests stops vLLM printing prompts (ticket text) even to that stdout.
+  # - --ulimit core=0 on every container, on top of the shell's ulimit -c 0 above: no core dump.
+  # - the explicit teardown BEFORE leakcheck: the check needs no model, so the GPU is freed and
+  #   the one container still touching real rows has no network at all. The trap's later run of
+  #   teardown is harmless (every step tolerates a missing container).
+  # - the rm -f of the old draft, report and catalog before anything starts: a run that fails before
+  #   its leak check (the build, the model server) would otherwise leave the PREVIOUS run's report and
+  #   catalog.json next to a missing or different draft, and `fetch` would hand them out.
+  # - the thread clamp is the same ON-THE-BOX clamp as windows a-d (see cmd_run).
+  remote "$script" || die "the sealed run failed - read the output above (the catalog CLI prints codes and counts only); nothing real is printed"
+  ok "sealed run completed: draft and leak report written"
+}
+
+# Re-run the leak check after the operator edited the draft: any edit changes the draft's
+# SHA-256 and so invalidates the report, and release refuses a report for other bytes.
+cmd_leakcheck() {
+  [[ "$WINDOW" == e ]] || die "'leakcheck' is only for window e"
+  bold "Leak check (no network)"
+  remote "ulimit -c 0; $(catalog_sealed "$(leakcheck_args)")" ||
+    die "the leak check failed or did not pass - read the report ON THE BOX"
+  ok "leak report written"
+}
+
+# The only way a catalog is made: catalog.release_gate refuses unless the report passed for the
+# exact bytes of the draft. --network=none because releasing needs no model and no network.
+cmd_release() {
+  [[ "$WINDOW" == e ]] || die "'release' is only for window e"
+  bold "Release the catalog (no network)"
+  remote "ulimit -c 0; $(catalog_sealed "$(release_args)")" ||
+    die "release refused - the report must have passed for the exact draft; run leakcheck again"
+  ok "catalog.json written"
+}
+
 cmd_verify() {
   bold "On-box verification"
   # Counts and verdicts only - this prints nothing derived from a row's content.
+  if [[ "$WINDOW" == e ]]; then
+    # Never prints a value: the recipe count, each check's name with ok/FAILED and its failure
+    # count, the report's verdict, and whether the report is for the CURRENT draft - the digest is
+    # computed by the same function the release gate uses, on the box, with no network.
+    local catalog_probe="podman run --rm --network=none -v $QUARANTINE:/q $IMAGE python -c \"
+import json
+from catalog.leakcheck import draft_digest
+d = json.load(open('/q/catalog.draft.json'))
+r = json.load(open('/q/catalog.leak_report.json'))
+print('recipes in draft     :', len(d['recipes']))
+for c in r['checks']:
+    print('check', c['name'], 'ok' if c['passed'] else 'FAILED', 'failures=%d' % c['failures'])
+print('report passed        :', r['passed'])
+print('report matches draft :', r['draft_sha256'] == draft_digest(d))
+\""
+    remote "$catalog_probe" || die "could not read the draft and report on the box"
+    cat <<EOF
+
+  Every check must read ok, 'report passed' must be True and 'report matches draft' True.
+  'report matches draft' False means the draft changed after the check: run leakcheck again.
+  0 recipes means the build produced nothing - the window is spent and the fix is in code.
+  This is counts and verdicts only: read the draft and the report themselves ON THE BOX.
+EOF
+    return 0
+  fi
   if [[ "$WINDOW" == d ]]; then
     local report_probe="podman run --rm --network=none -v $QUARANTINE:/q $IMAGE python -c \"
 import json
@@ -392,7 +602,13 @@ cmd_fetch() {
   The runbook requires $WINDOW_REVIEW to be read in full, ON THE BOX, before
   anything crosses. That review is the control this whole design rests on.
 EOF
-  confirm "Have you read the report on the box?" || die "stopping - read it first"
+  if [[ "$WINDOW" == e ]]; then
+    # The report alone only says the draft passed; the draft is what would be released.
+    confirm "Have you read BOTH the draft and the report, in full, on the box?" ||
+      die "stopping - read both first"
+  else
+    confirm "Have you read the report on the box?" || die "stopping - read it first"
+  fi
 
   mkdir -p "$ARTIFACTS"
   # Allowlist, not a wildcard. This is what stops the CSV or the detail log coming
@@ -450,6 +666,20 @@ cmd_all() {
   cmd_verify
   echo
   bold "Stopping here, deliberately"
+  if [[ "$WINDOW" == e ]]; then
+    cat <<EOF
+  Read BOTH files in full on the box before anything crosses:
+
+    ssh $HOST 'less $QUARANTINE/catalog.draft.json $QUARANTINE/catalog.leak_report.json'
+
+  Edit the draft by hand if needed (any edit invalidates the report), then:
+
+    infra/profiler/window.sh --window e leakcheck     # only after an edit
+    infra/profiler/window.sh --window e release
+    infra/profiler/window.sh --window e fetch --clean
+EOF
+    return 0
+  fi
   cat <<EOF
   Read the report on the box before anything crosses:
 
@@ -488,6 +718,20 @@ window_contract "$WINDOW"
 if (( ! DRY_RUN )) && [[ "$QUARANTINE" == *"<"* ]]; then
   die "quarantine path is still the placeholder: export RECALL_WINDOW_QUARANTINE=/data/<box-user>/recall-quarantine (your writable per-user directory on the box) or pass --quarantine"
 fi
+
+# Window e's two pins are as placeholder-guarded as the quarantine path: a real run must not start
+# an LLM container from "<vllm-image@sha256:digest>" or mount "<hf-cache-dir>". Only the commands
+# that start or check the LLM need them; leakcheck, release and verify never touch the LLM.
+if (( ! DRY_RUN )) && [[ "$WINDOW" == e ]]; then
+  case "$COMMAND" in
+    ship|run|all)
+      [[ "$LLM_IMAGE" == *"<"* ]] &&
+        die "LLM image is still the placeholder: export RECALL_WINDOW_LLM_IMAGE=docker.io/vllm/vllm-openai@sha256:<digest> (the image pinned on the box)"
+      [[ "$HF_CACHE" == *"<"* && "$COMMAND" != ship ]] &&
+        die "Hugging Face cache is still the placeholder: export RECALL_WINDOW_HF_CACHE=/data/<box-user>/<hf-cache> (the host directory holding the model weights)"
+      ;;
+  esac
+fi
 (( DRY_RUN )) && bold "DRY RUN - nothing will be changed on $HOST"
 
 case "$COMMAND" in
@@ -495,7 +739,9 @@ case "$COMMAND" in
   push)   cmd_push ;;
   run)    cmd_run ;;
   verify) cmd_verify ;;
-  fetch)  cmd_fetch ;;
+  leakcheck) cmd_leakcheck ;;
+  release) cmd_release ;;
+  fetch) cmd_fetch ;;
   clean)  cmd_clean ;;
   status) cmd_status ;;
   all)    cmd_all ;;

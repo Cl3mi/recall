@@ -10,7 +10,7 @@ export PG_DSN
 RECALL_PG_DSN ?= $(PG_DSN)
 export RECALL_PG_DSN
 
-.PHONY: db-up db-down db-reset migrate test lint local-dirs check-clean window-a-rehearsal window-b-rehearsal window-d-rehearsal guard-install guard-test publish
+.PHONY: db-up db-down db-reset migrate test lint local-dirs check-clean window-a-rehearsal window-b-rehearsal window-d-rehearsal window-e-rehearsal guard-install guard-test leak-test publish
 
 local-dirs:
 	mkdir -p local/artifacts local/fixtures local/quarantine
@@ -54,6 +54,9 @@ window-b-rehearsal:
 window-d-rehearsal:
 	./infra/profiler/rehearse-window-d.sh
 
+window-e-rehearsal:
+	./infra/profiler/rehearse-window-e.sh
+
 guard-install:
 	git config core.hooksPath .githooks
 
@@ -65,3 +68,7 @@ publish:
 # Needs the project venv (uv run): the tests import the `recall` package, not just stdlib.
 guard-test:
 	uv run pytest tests/guard
+
+# Leak check, release gate and the hostile-LLM suite; all in-memory, no corpus needed.
+leak-test:
+	uv run pytest tests/leak -q

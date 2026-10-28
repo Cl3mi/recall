@@ -48,11 +48,20 @@ ENV HF_HUB_OFFLINE=1 \
 # be mounted over /work in a window.
 COPY insight ./insight
 
+# Window E's catalog extraction (build, leakcheck, release, and the stub LLM server the
+# rehearsal uses). Same reasoning as insight: after the weights, so the heavy layers stay cached.
+COPY catalog ./catalog
+# `catalog build --llm vllm` imports its HTTP client lazily from fixtures.llm; without this the
+# image would only fail inside the sealed window, when the build step reaches the LLM.
+COPY fixtures ./fixtures
+
 # Proves the image works offline before a single real row is anywhere near it - and that the
 # MODEL loads offline, which turns missing weights into a build failure rather than a
-# sealed-window one. insight.__main__ is imported too, so a missing module is a build failure.
+# sealed-window one. insight.__main__, catalog.__main__ and catalog.stubserver are imported
+# too, so a missing module is a build failure.
 RUN python -c "\
 import profiler.__main__, insight.__main__, recall.clean.pipeline; \
+import catalog.__main__, catalog.stubserver, fixtures.llm; \
 from profiler.gate.embedder import E5Embedder; \
 v = E5Embedder().encode(['passage: Pumpe undicht']); \
 assert v.shape[0] == 1, v.shape; \

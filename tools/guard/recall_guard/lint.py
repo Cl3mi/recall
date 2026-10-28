@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .names import data_suffix
 
-SCOPE_PREFIXES = ("src/", "profiler/", "insight/", "fixtures/")
+SCOPE_PREFIXES = ("src/", "profiler/", "insight/", "fixtures/", "catalog/")
 EXEMPT = ("src/recall/sealed.py",)
 PRAGMA = "# guard: ok"
 HINT = (
