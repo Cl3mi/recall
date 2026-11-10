@@ -436,6 +436,19 @@ release_args()   { printf '%s' "release --draft catalog.draft.json --report cata
 cmd_run_e() {
   local device_arg="$1"
   local tries=$(( READY_BUDGET_S / READY_POLL_S ))
+  # GPU pre-flight: a tiny container with the claimed device and NOTHING mounted, started before
+  # the network, the model server or any weights are touched. Since the 2026-10-27 reboot a stale
+  # CDI spec made every GPU container fail at start (crun: cannot stat libEGL_nvidia...); finding
+  # that out after the model server had been waiting out its readiness budget cost a window. The
+  # container sees no real data, so its own error text is safe to print (3 lines). Exit 6.
+  local preflight=""
+  if [[ -n "$device_arg" ]]; then
+    preflight="if ! GPU_OUT=\$(timeout 120 podman run --rm --network=none --ulimit core=0 $device_arg $IMAGE python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 7)' 2>&1); then
+  echo 'ABORT GPU_PREFLIGHT a GPU container does not start or sees no GPU; nothing was started. A stale CDI spec on the box is the usual cause (an admin regenerates it); do not work around it here.' >&2
+  echo \"\$GPU_OUT\" | tail -n 3 >&2
+  exit 6
+fi"
+  fi
   local script
   script="$(cat <<EOF
 set -e
@@ -450,6 +463,7 @@ trap teardown EXIT
 trap 'exit 1' HUP INT TERM
 ulimit -c 0
 rm -f $QUARANTINE/catalog.draft.json $QUARANTINE/catalog.leak_report.json $QUARANTINE/catalog.json
+$preflight
 podman network create --internal \$NET >/dev/null
 podman run -d --rm --name \$LLM --network \$NET --network-alias llm $device_arg --ipc=host \
   -v $HF_CACHE:/root/.cache/huggingface:ro -e HF_HUB_OFFLINE=1 --ulimit core=0 --log-driver=none \

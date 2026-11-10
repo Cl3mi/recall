@@ -523,11 +523,23 @@ First, whatever fails: the model server and the network are removed automaticall
   `podman run` by hand for the same image (no ticket data is involved at this stage), and see the first-run
   list above. The export is untouched; shred it if you stop here.
 - **"fairuse refused GPU 0".** The card is busy. Wait. Do not override.
+- **`ABORT GPU_PREFLIGHT`** (exit 6, within seconds). The first thing `run` does is start a tiny container
+  with the claimed GPU and nothing mounted; it either failed to start or sees no GPU, so nothing else was
+  started and the export is untouched. The last lines show the container's own error. A stale CDI spec
+  (`crun: cannot stat ...libEGL_nvidia...` after a driver update) is the known cause: a box admin
+  regenerates `/etc/cdi/nvidia.yaml`. Do not work around it from here and do not rerun in a loop.
 - **"podman network create --internal does not work on the box" (from `ship`).** Window E cannot be
   isolated. **Do not run it** without an internal network, and do not replace it with a plain one.
 - **`build` printed `recipes=0`** (or `verify` says 0 recipes). Every cluster was rejected: too few
   tickets, dealers or vehicles behind a cluster, or the model's answers did not parse. The window is
-  spent. Shred (`clean`) and fix in code, without the data.
+  spent. Shred (`clean`) and fix in code, without the data. The `diagnostics` line and the `rejected`
+  line before the abort hold counts only: `rare_words_*` (drafts refused for words below the floor),
+  `shape_<reason>` (type, empty, length, angle, chars, count, duplicate), `rejected identity_token`
+  and `incoherent_<reason>` (the model's coded reason for refusing a cluster: `gemischt` = several
+  different problems, none in half of the tickets; `kein_technisches_problem` = queries, admin,
+  delivery; `unklar` = too little information; `other` = no valid code). A cluster is accepted when at
+  least half of its sampled tickets describe the same technical problem. They say which gate refused
+  the drafts without naming a word; write them down before `clean`.
 - **`leakcheck` failed** (exit 2, `passed=False`). The names above say which:
   - `vocabulary_floor FAILED`: a recipe uses a word that too few tickets, dealers or vehicles used
     (a rare word can be one person's habit or a name).

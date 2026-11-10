@@ -50,6 +50,7 @@ SUBSTITUTIONS=(
   "build runs --workers 2 instead of 8"
   "the LLM container runs catalog.stubserver (the fake drafter) instead of vLLM; the image is this one, tagged as the stand-in"
   "no GPU: --device and --ipc=host are dropped, the read-only weights mount is dropped"
+  "the GPU pre-flight's torch check runs as python -c pass (no GPU to prove); a broken GPU is simulated with RH_GPU_BROKEN=1 in its own phase"
   "foreground containers run without --rm and are removed by the shim after docker inspect"
   "every container runs as this user's uid, so the scratch quarantine stays removable"
   "ssh and scp run locally; gpu-fairuse2.sh is a stub that claims a made-up GPU id"
@@ -267,6 +268,12 @@ printf '%s\n' "${orig[@]}" > "$LOG/args-$name.txt"
 
 if [[ "$image" == "$RH_STANDIN" ]]; then
   rest=(python -m catalog.stubserver --host 0.0.0.0 --port 8000 --model "$RH_MODEL")
+fi
+# The GPU pre-flight (window.sh asks torch whether CUDA is visible). A workstation without the
+# claimed GPU cannot prove that, so it runs a no-op; RH_GPU_BROKEN=1 makes it fail like the box does.
+if [[ "${rest[*]}" == *"torch.cuda.is_available"* ]]; then
+  if [[ "${RH_GPU_BROKEN:-}" == 1 ]]; then rest=(python -c "import sys; sys.exit(7)")
+  else rest=(python -c "pass"); fi
 fi
 fixed=()
 i=0
@@ -564,6 +571,22 @@ L="$(leftovers)"
   || bad "(f) a stale catalog.draft.json survived the failed run"
 [[ ! -e "$QDIR/catalog.leak_report.json" ]] && ok "(f) no stale leak report survives a failed run" \
   || bad "(f) a stale catalog.leak_report.json survived the failed run"
+
+# ---------------------------------------------------------------- broken GPU
+head2 "A broken GPU: the pre-flight stops the run before any network or model server exists"
+printf '{"stale": true}' > "$QDIR/catalog.draft.json"
+NETS_BEFORE="$(find "$WORK/log" -name 'network-*.args' | wc -l)"
+RH_GPU_BROKEN=1 wl run
+(( RC != 0 )) && ok "(m) a run with a broken GPU exits non-zero" || bad "(m) a run with a broken GPU exited 0"
+grep -q 'ABORT GPU_PREFLIGHT' <<<"$OUT" && ok "(m) the abort names GPU_PREFLIGHT" \
+  || bad "(m) no ABORT GPU_PREFLIGHT line"
+[[ "$(find "$WORK/log" -name 'network-*.args' | wc -l)" == "$NETS_BEFORE" ]] \
+  && ok "(m) no network was created for the broken run" || bad "(m) a network was created before the pre-flight failed"
+L="$(leftovers)"
+[[ -z "$L" ]] && ok "(m) nothing is left behind after the pre-flight abort" \
+  || bad "(m) the pre-flight abort left behind: $(tr '\n' ' ' <<<"$L")"
+[[ ! -e "$QDIR/catalog.draft.json" ]] && ok "(m) no stale draft survives the pre-flight abort" \
+  || bad "(m) a stale catalog.draft.json survived the pre-flight abort"
 
 # ---------------------------------------------------------------- output hygiene
 head2 "The rehearsal's own output"
