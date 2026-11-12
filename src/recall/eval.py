@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from insight import extract
 from recall import index, retrieve
 
-QUERY_PREFIX = "query: "
+QUERY_PREFIX = index.QUERY
 CAVEAT = (
     "Scores on a synthetic corpus are evidence that the code is correct, not evidence of "
     "retrieval quality on real tickets: stand-in text is far more regular than real text."
@@ -27,8 +27,10 @@ VARIANTS = {
     "dense_passage": {"arms": ("dense",), "prefix": index.PASSAGE},
     "dense_query": {"arms": ("dense",), "prefix": QUERY_PREFIX},
     "lexical": {"arms": ("lexical",)},
-    "fused": {},  # dense with the search default prefix (passage:) plus lexical
+    "fused": {"prefix": index.PASSAGE},  # baseline: dense with passage: plus lexical
     "fused_query": {"prefix": QUERY_PREFIX},  # dense with query: plus lexical
+    # One weight only: lexical is unusually regular on invented text, so do not tune several.
+    "fused_dense2": {"prefix": QUERY_PREFIX, "weights": {"dense": 2.0}},
 }
 # What a ticket is asked with. A technician rarely pastes a whole indexed ticket: "title" is the
 # first line only, "head" the first HEAD_WORDS words, a short search phrase.

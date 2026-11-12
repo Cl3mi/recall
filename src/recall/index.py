@@ -20,6 +20,7 @@ from recall.clean import pipeline
 
 DIM = 1024
 PASSAGE = "passage: "  # same prefix as the leakage gate, so stored vectors match what it measured
+QUERY = "query: "  # e5 prefix for what a technician types; stored vectors stay PASSAGE
 BATCH = 64
 _SPACE = re.compile(r"\s+")
 

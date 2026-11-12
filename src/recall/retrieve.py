@@ -32,8 +32,14 @@ class Hit:
     )  # arm -> 1-based rank, only arms that found it
 
 
-def fuse(arms: dict[str, list[str]], *, limit: int | None = None) -> list[Hit]:
-    """Fuse ranked id lists: score = sum over arms of 1 / (RRF_K + rank).
+def fuse(
+    arms: dict[str, list[str]],
+    *,
+    limit: int | None = None,
+    weights: dict[str, float] | None = None,
+) -> list[Hit]:
+    """Fuse ranked id lists: score = sum over arms of weight / (RRF_K + rank), weight 1.0 unless
+    `weights` names the arm.
 
     Ties go to the better best rank, then to the id, so the order never depends on the order of
     `arms`. An id repeated inside one arm counts once, at its first rank.
@@ -46,7 +52,9 @@ def fuse(arms: dict[str, list[str]], *, limit: int | None = None) -> list[Hit]:
             if doc_id in seen:
                 continue
             seen.add(doc_id)
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1 / (RRF_K + position)
+            scores[doc_id] = scores.get(doc_id, 0.0) + (weights or {}).get(arm, 1.0) / (
+                RRF_K + position
+            )
             ranks.setdefault(doc_id, {})[arm] = position
     ordered = sorted(scores, key=lambda d: (-scores[d], min(ranks[d].values()), d))
     hits = [Hit(d, scores[d], dict(sorted(ranks[d].items()))) for d in ordered]
@@ -87,14 +95,16 @@ def search(
     arms: tuple[str, ...] = ARMS,
     exclude_id: str | None = None,
     before: date | None = None,
-    prefix: str = index.PASSAGE,
+    prefix: str = index.QUERY,
+    weights: dict[str, float] | None = None,
 ) -> list[Hit]:
     """The top k fused hits for text, each carrying its per-arm ranks.
 
     The query is cleaned exactly like the indexed text (index/query symmetry). exclude_id keeps
     an indexed ticket from finding itself when it is the query; before keeps only candidates
     created before that date, so the future cannot leak into the past. prefix is the e5 prefix
-    of the query embedding (the stored vectors use "passage: ").
+    of the query embedding (the stored vectors use "passage: "). weights scales an arm's RRF
+    contribution (see fuse).
     """
     unknown = [arm for arm in arms if arm not in ARMS]
     if unknown:
@@ -111,4 +121,4 @@ def search(
         if query:
             rows = conn.execute(_LEXICAL, {**params, "query": query}).fetchall()
             found["lexical"] = [r[0] for r in rows]
-    return fuse(found, limit=k)
+    return fuse(found, limit=k, weights=weights)

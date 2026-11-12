@@ -283,17 +283,17 @@ git commit -m "feat(m3): opt-in per-group metrics for synthetic corpora"
 
 **Files:** none changed; results go into this plan.
 
-- [ ] **Step 1: Get the code onto the GPU box.** `make publish` on the workstation, then `git pull`
+- [x] **Step 1: Get the code onto the GPU box.** `make publish` on the workstation, then `git pull`
   in the box's checkout. If the repo is private again the box cannot pull: ask the user whether to
   make it public for the pull. Confirm with `git log --oneline -1` on both sides.
-- [ ] **Step 2: Bring the box up.** The Postgres container and the fixture are described in
+- [x] **Step 2: Bring the box up.** The Postgres container and the fixture are described in
   `docs/handoff-hpc-continuation-2026-11-10.md` (evening update). Rootless containers die with the
   last ssh session: restart the container and hold a session open before the run. The fixture
   (`dev3-confusable`) is already on the box; do not regenerate it, because the eval is only
   comparable on the same corpus.
-- [ ] **Step 3: The user runs the eval** with the command from that handoff section, adding
+- [x] **Step 3: The user runs the eval** with the command from that handoff section, adding
   `--per-group` (the guard blocks agent commands that name data files) and pastes the JSON.
-- [ ] **Step 4: Record the results** in this plan under "Results, 2026-11-11" (table for
+- [x] **Step 4: Record the results** in this plan under "Results, 2026-11-11" (table for
   `fused_query` next to `fused`, and the per-group recall@10 for the twin pairs), then commit
   `docs(m3): ...`.
 
@@ -317,7 +317,7 @@ Do only the steps the Task 11 table calls for.
 
 **Step A: make `query:` the default query prefix** (only if `dense_query` beat `dense_passage`)
 
-- [ ] **A1. Write the failing test** in `tests/unit/test_eval_variants.py`:
+- [x] **A1. Write the failing test** in `tests/unit/test_eval_variants.py`:
 
 ```python
 from recall import index, retrieve
@@ -331,20 +331,20 @@ def test_queries_default_to_the_query_prefix_and_stored_vectors_keep_passage():
     assert ev.VARIANTS["fused"] == {"prefix": index.PASSAGE}  # the baseline stays the baseline
 ```
 
-- [ ] **A2. Run it**: expected FAIL (`AttributeError: module 'recall.index' has no attribute 'QUERY'`).
-- [ ] **A3. Implement.** In `src/recall/index.py` after the `PASSAGE` line add
+- [x] **A2. Run it**: expected FAIL (`AttributeError: module 'recall.index' has no attribute 'QUERY'`).
+- [x] **A3. Implement.** In `src/recall/index.py` after the `PASSAGE` line add
   `QUERY = "query: "  # e5 prefix for what a technician types; stored vectors stay PASSAGE`.
   In `src/recall/retrieve.py` change `prefix: str = index.PASSAGE,` to `prefix: str = index.QUERY,`
   and the docstring sentence "(the stored vectors use "passage: ")" stays true. In
   `src/recall/eval.py` set `QUERY_PREFIX = index.QUERY` (line 21) and change the `"fused"` entry to
   `"fused": {"prefix": index.PASSAGE},  # baseline: dense with passage: plus lexical`.
-- [ ] **A4. Run the whole suite** (with `PG_DSN`): `... pytest -q`. Expected: all passed. A test
+- [x] **A4. Run the whole suite** (with `PG_DSN`): `... pytest -q`. Expected: all passed. A test
   that pinned the old default is a real finding: stop and report it, do not adjust the test blindly.
-- [ ] **A5. Commit**: `git add` the touched files, `git commit -m "feat(m3): queries use the query prefix by default"`.
+- [x] **A5. Commit**: `git add` the touched files, `git commit -m "feat(m3): queries use the query prefix by default"`.
 
 **Step B: weighted fusion** (only if `fused_query` is below max(`dense_query`, `lexical`) in some mode)
 
-- [ ] **B1. Write the failing test** (append to `tests/unit/test_retrieve_fusion.py`):
+- [x] **B1. Write the failing test** (append to `tests/unit/test_retrieve_fusion.py`):
 
 ```python
 def test_a_heavier_arm_outvotes_the_other():
@@ -354,8 +354,8 @@ def test_a_heavier_arm_outvotes_the_other():
     assert [h.doc_id for h in weighted] == ["b", "a"]
 ```
 
-- [ ] **B2. Run it**: expected FAIL (`TypeError: fuse() got an unexpected keyword argument 'weights'`).
-- [ ] **B3. Implement.** In `src/recall/retrieve.py` change `fuse` to
+- [x] **B2. Run it**: expected FAIL (`TypeError: fuse() got an unexpected keyword argument 'weights'`).
+- [x] **B3. Implement.** In `src/recall/retrieve.py` change `fuse` to
   `def fuse(arms, *, limit=None, weights: dict[str, float] | None = None)`, change the score line to
   `scores[doc_id] = scores.get(doc_id, 0.0) + (weights or {}).get(arm, 1.0) / (RRF_K + position)`,
   add `weights: dict[str, float] | None = None` to `search` (after `prefix`) and pass
@@ -438,3 +438,62 @@ fusion beats the best arm with the `query:` dense arm was not run: that is Task 
    to plan with.
 6. **Not answered:** the report is macro only, so twin-pair separation (R001/R009, R002/R010,
    R003/R012, R004/R011) is unmeasured: Task 10 and Task 11.
+
+## Results, 2026-11-11 (same corpus, same index, adds `fused_query` and `--per-group`)
+
+Run on the GPU box from the published snapshot of `1f9824f` (e5 on CPU, same pinned revision, same
+`dev3-confusable` fixture, not regenerated). The four variants that existed before reproduce the
+2026-11-10 numbers to the last digit, so the two runs are comparable.
+
+recall@10 (MRR in brackets), macro over 12 groups:
+
+| query | dense `query:` | dense `passage:` | lexical | `fused` (passage:) | `fused_query` |
+|---|---|---|---|---|---|
+| full | **0.820** (0.944) | 0.753 (0.943) | 0.666 (0.759) | 0.789 (0.936) | 0.806 (0.910) |
+| title | 0.673 (0.811) | 0.542 (0.801) | 0.685 (0.720) | 0.627 (0.802) | **0.688** (0.782) |
+| head | 0.699 (0.832) | 0.594 (0.796) | 0.682 (0.735) | 0.665 (0.805) | **0.736** (0.819) |
+
+Per-group recall@10, full / title / head. Twin pairs are R001/R009, R002/R010, R003/R012,
+R004/R011; R001-R003 have 102-103 tickets, every other group 22 (R004: 26).
+
+| group | role | dense `query:` | lexical | `fused_query` |
+|---|---|---|---|---|
+| R001 | original | 0.94 / 0.75 / 0.77 | 0.98 / 0.94 / 0.97 | 0.96 / 0.86 / 0.84 |
+| R009 | twin of R001 | 0.50 / 0.25 / 0.27 | 0.11 / 0.08 / 0.08 | 0.36 / 0.14 / 0.17 |
+| R002 | original | 0.94 / 0.82 / 0.82 | 0.93 / 0.85 / 0.84 | 0.96 / 0.86 / 0.90 |
+| R010 | twin of R002 | 0.55 / 0.30 / 0.36 | 0.47 / 0.31 / 0.36 | 0.58 / 0.39 / 0.36 |
+| R003 | original | 0.97 / 0.86 / 0.97 | 0.13 / 0.03 / 0.05 | 0.98 / 0.93 / 0.96 |
+| R012 | twin of R003 | 0.84 / 0.14 / 0.16 | 0.97 / 0.98 / 0.98 | 0.83 / 0.07 / 0.47 |
+| R004 | original (small) | 0.60 / 0.39 / 0.54 | 0.45 / 0.42 / 0.45 | 0.60 / 0.44 / 0.59 |
+| R011 | twin of R004 | 0.59 / 0.57 / 0.57 | 0.60 / 0.61 / 0.63 | 0.64 / 0.63 / 0.64 |
+| R005-R008 | no twin (mean) | 0.98 / 0.99 / 0.98 | 0.84 / 1.00 / 0.96 | 0.95 / 0.98 / 0.98 |
+
+**Answers to the Task 11 table.**
+
+1. **`query:` beats `passage:`** in every mode, by 6.7 / 13.1 / 10.5 points. Task 12 step A applies.
+2. **Fusion does not beat its own inputs in every mode.** `fused_query` vs max(`dense_query`,
+   `lexical`): full -1.4 points (0.806 vs 0.820), title +0.3 (a tie), head +3.7. Its MRR is below
+   dense `query:` in all three modes. By the table's rule Task 12 step B applies (one dense-weighted
+   variant, then one more run). `fused_query` beats the old `fused` by 1.7 / 6.1 / 7.1 points, so the
+   `query:` arm is the better input for fusion either way.
+3. **The twins fail; the other groups do not.** The small side of each pair (R004, R009-R012)
+   averages 0.60 / 0.33 / 0.45 under `fused_query` against 0.95 / 0.98 / 0.98 for the four groups
+   without a twin, and the best single arm does not close the gap (dense `query:` 0.62 / 0.33 / 0.38).
+   The loss is concentrated, not spread evenly, which is the reranker branch of Task 13's rule.
+   Task 13 is the operator's decision; this only records what the rule reads.
+
+**Readings.**
+
+1. **The arms fail on different twins, and in opposite directions.** Lexical cannot tell R003 from
+   R012 (0.13 vs 0.97) or R009 from R001 (0.11 vs 0.98): the shared wording sends both twins to the
+   same side. Dense keeps the large originals (0.94-0.97) and loses the small twins. Fusion inherits
+   both: it rescues R012 on head queries (0.47, dense alone 0.16) and drags R009 below dense alone
+   (0.36 vs 0.50 on full).
+2. **Group size matters in the pairs.** Where an original of about 100 tickets has a twin of 22, the
+   twin loses; R004/R011 (26 and 22) are both near 0.6. The report cannot show what fills the top 10,
+   so "the large twin crowds it out" is the likely reading, not a measured one.
+3. **MRR stays high for twins on full queries** (dense `query:` 0.79-0.97): the first hit is often
+   right and the rest of the top 10 is not. That is the shape a reranker over a deeper candidate list
+   can fix, if the right tickets are in that list; this run does not measure recall beyond 10.
+4. Same caveat as before: invented text, so these numbers locate failure modes, not quality on real
+   tickets.
