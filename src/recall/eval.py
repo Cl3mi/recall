@@ -27,7 +27,8 @@ VARIANTS = {
     "dense_passage": {"arms": ("dense",), "prefix": index.PASSAGE},
     "dense_query": {"arms": ("dense",), "prefix": QUERY_PREFIX},
     "lexical": {"arms": ("lexical",)},
-    "fused": {},
+    "fused": {},  # dense with the search default prefix (passage:) plus lexical
+    "fused_query": {"prefix": QUERY_PREFIX},  # dense with query: plus lexical
 }
 # What a ticket is asked with. A technician rarely pastes a whole indexed ticket: "title" is the
 # first line only, "head" the first HEAD_WORDS words, a short search phrase.
@@ -73,35 +74,53 @@ def score(
     relevant: dict[str, set[str]],
     group: dict[str, str],
     k: int = 10,
+    per_group: bool = False,
 ) -> dict:
     """Macro-averaged recall@k, MRR and nDCG@k. A query with no relevant document is counted
-    in `n_unscored` and otherwise ignored; with nothing scorable the metrics are None."""
-    per_group: dict[str, list[QueryMetrics]] = defaultdict(list)
+    in `n_unscored` and otherwise ignored; with nothing scorable the metrics are None.
+
+    `per_group` adds the same three numbers for every group under "groups". It is for synthetic
+    corpora only: a group key on real data is a fehlercode, which must not leave the sealed root."""
+    by_group: dict[str, list[QueryMetrics]] = defaultdict(list)
     unscored = 0
     for query, ranked in rankings.items():
         wanted = relevant.get(query, set())
         if not wanted:
             unscored += 1
             continue
-        per_group[group[query]].append(query_metrics(ranked, wanted, k))
+        by_group[group[query]].append(query_metrics(ranked, wanted, k))
+
+    def mean(ms: list[QueryMetrics], pick) -> float:
+        return sum(pick(m) for m in ms) / len(ms)
 
     def macro(pick) -> float | None:
-        if not per_group:
+        if not by_group:
             return None
-        return sum(sum(pick(m) for m in ms) / len(ms) for ms in per_group.values()) / len(per_group)
+        return sum(mean(ms, pick) for ms in by_group.values()) / len(by_group)
 
-    return {
+    result = {
         "k": k,
-        "n_queries": sum(len(ms) for ms in per_group.values()),
+        "n_queries": sum(len(ms) for ms in by_group.values()),
         "n_unscored": unscored,
-        "n_groups": len(per_group),
+        "n_groups": len(by_group),
         f"recall_at_{k}": macro(lambda m: m.recall),
         "mrr": macro(lambda m: m.rr),
         f"ndcg_at_{k}": macro(lambda m: m.ndcg),
     }
+    if per_group:
+        result["groups"] = {
+            name: {
+                "n_queries": len(ms),
+                f"recall_at_{k}": mean(ms, lambda m: m.recall),
+                "mrr": mean(ms, lambda m: m.rr),
+                f"ndcg_at_{k}": mean(ms, lambda m: m.ndcg),
+            }
+            for name, ms in sorted(by_group.items())
+        }
+    return result
 
 
-def run_synthetic(conn, embedder, k: int = 10) -> dict:
+def run_synthetic(conn, embedder, k: int = 10, per_group: bool = False) -> dict:
     """Score the indexed corpus against its labels: every ticket whose group has at least two
     members is a query, the rest of its group is relevant, and the ticket itself is excluded.
 
@@ -132,7 +151,7 @@ def run_synthetic(conn, embedder, k: int = 10) -> dict:
                 ]
                 for ticket_id, text, *_ in queries
             }
-            modes[mode][name] = score(rankings, relevant, group, k)
+            modes[mode][name] = score(rankings, relevant, group, k, per_group)
 
     earlier = {r[0]: (r[2], r[3]) for r in rows}
     with_history = sum(
@@ -193,6 +212,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--labels", type=pathlib.Path, required=True)
     parser.add_argument("--embedder", choices=("hashing", "e5"), default="hashing")
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument(
+        "--per-group",
+        action="store_true",
+        help="synthetic labels only: on real data a group key is a fehlercode",
+    )
     args = parser.parse_args(argv)
 
     embedder = HashingEmbedder(dim=index.DIM) if args.embedder == "hashing" else E5Embedder()
@@ -200,7 +224,8 @@ def main(argv: list[str] | None = None) -> int:
     migrate.apply_all(settings.pg_dsn)
     index.build(settings.pg_dsn, rows, embedder, labels=load_labels(args.labels))
     with psycopg.connect(settings.pg_dsn) as conn:
-        print(json.dumps(run_synthetic(conn, embedder, k=args.k), indent=2))
+        report = run_synthetic(conn, embedder, k=args.k, per_group=args.per_group)
+        print(json.dumps(report, indent=2))
     return 0
 
 
