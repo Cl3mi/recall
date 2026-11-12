@@ -1,8 +1,8 @@
 # State: M3 retrieval on the dev3 stand-in
 
 Plan: `docs/superpowers/plans/2026-11-05-m3-retrieval-on-dev3-standin.md`
-Milestone: "per-group results in hand" reached (task 11 of 13, 2026-11-12); Task 12 code done
-(A 0f901bc, B 38d0403); next is the `fused_dense2` run (Task 12 B4, the user runs it)
+Milestone: "fusion decision applied" reached (task 12 of 13, 2026-11-12); next is Task 13, the
+operator's M4 decision
 
 ## Completed task IDs
 - Task 1 (migration and tables)
@@ -16,6 +16,8 @@ Milestone: "per-group results in hand" reached (task 11 of 13, 2026-11-12); Task
 - Task 10 (opt-in per-group metrics, `--per-group`, 897b88f)
 - Task 11 (re-run on the GPU box from the snapshot of 1f9824f; results in the plan,
   "Results, 2026-11-11")
+- Task 12 (A: `query:` default, 0f901bc; B: weighted RRF and `fused_dense2`, 38d0403; B4 run
+  recorded in the plan, "Results, 2026-11-12")
 
 Task 8 (real-data wrapper, Window C) is deferred on purpose; it needs an operator window and gets
 its own plan.
@@ -31,10 +33,11 @@ plan's "Results, 2026-11-11"; the old four variants reproduced exactly, so the r
    Task 13's rule (the operator decides Task 13).
 
 ## What's next
-**Task 12** steps A and B1-B3 are committed: `query:` is the default query prefix (0f901bc;
-`fused` pinned to `passage:` as the baseline), and `fuse`/`search` take `weights` with one variant
-`fused_dense2` (dense weight 2.0, 38d0403). Left: B4, one more Task 11 run to score `fused_dense2`
-(the user publishes and runs it), record it in the plan, checkpoint "fusion decision applied".
+Task 12 is done. `fused_dense2` did not beat its best input in every mode either (-0.7 / -0.6 /
++2.1); the fused variants differ by 1 to 2 points while the twin gap is 35 to 66. The code keeps
+`query:` plus plain RRF as the `search` default; weights stay available, no tuning on stand-in text.
+**Task 13** is next and is the operator's decision (reranker vs Task 8 first); the plan's rule
+reads "reranker" from the per-group numbers. Do not start it without the operator.
 Full suite: 2251 passed; the 2 failures in `tests/unit/test_window_d_contract.py` predate this work
 (they pin `infra/profiler/window.sh --dry-run` output) and are not M3's. Then Task 13, which is the operator's decision. Box mechanics are
 in `docs/handoff-hpc-continuation-2026-11-10.md`, evening update; the restart of `recall-eval-pg`

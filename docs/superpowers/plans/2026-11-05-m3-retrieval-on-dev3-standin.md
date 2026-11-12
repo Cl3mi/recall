@@ -363,7 +363,7 @@ def test_a_heavier_arm_outvotes_the_other():
   `"fused_dense2": {"prefix": QUERY_PREFIX, "weights": {"dense": 2.0}},` and add it to the variant
   sets in `tests/unit/test_eval_variants.py` and `tests/integration/test_eval_synthetic.py`.
   One weight only: lexical is unusually regular on invented text, so do not tune several.
-- [ ] **B4. Run the suite, commit** (`feat(m3): weighted rank fusion and one dense-weighted variant`),
+- [x] **B4. Run the suite, commit** (`feat(m3): weighted rank fusion and one dense-weighted variant`),
   then repeat Task 11 steps 1 to 4 once to score `fused_dense2`.
 
 > **Milestone: fusion decision applied** - state must be checkpointed here before continuing.
@@ -497,3 +497,36 @@ R004/R011; R001-R003 have 102-103 tickets, every other group 22 (R004: 26).
    can fix, if the right tickets are in that list; this run does not measure recall beyond 10.
 4. Same caveat as before: invented text, so these numbers locate failure modes, not quality on real
    tickets.
+
+## Results, 2026-11-12 (Task 12 B4: `fused_dense2`)
+
+Same box, same fixture, same index, from the published snapshot of `f0a5934` (`query:` is now the
+search default; `fused` pins `passage:` explicitly). The five earlier variants reproduce the
+2026-11-11 numbers exactly.
+
+recall@10 (MRR in brackets):
+
+| query | dense `query:` | lexical | `fused_query` | `fused_dense2` (dense x2) |
+|---|---|---|---|---|
+| full | **0.820** (0.944) | 0.666 (0.759) | 0.806 (0.910) | 0.813 (0.938) |
+| title | 0.673 (0.811) | 0.685 (0.720) | **0.688** (0.782) | 0.679 (0.801) |
+| head | 0.699 (0.832) | 0.682 (0.735) | **0.736** (0.819) | 0.720 (0.836) |
+
+Per-group recall@10 of `fused_dense2`, full / title / head: the small twins (R004, R009-R012)
+average 0.61 / 0.32 / 0.42, the four groups without a twin 0.96 / 0.98 / 0.98. Worst: R009
+0.43 / 0.19 / 0.23 and R012 0.83 / 0.06 / 0.27.
+
+**Fusion decision.**
+
+1. **No fused variant beats its best input in every mode.** `fused_dense2` vs max(dense `query:`,
+   lexical): -0.7 / -0.6 / +2.1 points. Doubling dense trades recall on short queries for MRR
+   (0.938 vs 0.910 on full) and lands between plain RRF and dense alone.
+2. **The spread between the fused variants is 1 to 2 points** on groups of 22 queries, against a
+   gap of 35 to 66 points between the small twins and the other groups. Fusion weights are not where
+   the loss is, and tuning them on invented text would fit lexical's unusual regularity (B3's note).
+3. **What the code does now:** `search` defaults to `query:` and plain RRF (`weights=None`). That is
+   the best fused choice on short queries, which are what a technician types (title, head), and
+   within 1.4 points of dense alone on full tickets. `weights` stays available and `fused_dense2`
+   stays in the report as the comparison. No further default change is made on stand-in numbers;
+   real data (Task 8) decides whether lexical earns its place.
+4. No fusion setting closes the twin gap, so Task 13's reading stands.
