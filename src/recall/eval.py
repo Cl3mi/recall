@@ -36,6 +36,26 @@ VARIANTS = {
 # first line only, "head" the first HEAD_WORDS words, a short search phrase.
 QUERY_MODES = ("full", "title", "head")
 HEAD_WORDS = 8
+# The deepest list there is: two arms of POOL fuse into at most 2 * POOL ids, so recall at this
+# depth is recall over the union of both pools, the ceiling of any rerank over them.
+ALL_DEPTH = 2 * retrieve.POOL
+
+
+def parse_depths(text: str) -> tuple[int | str, ...]:
+    """`10,50,all` as (10, 50, "all"); a depth is a positive integer or `all`."""
+    depths: list[int | str] = []
+    for part in text.split(","):
+        if part == "all":
+            depths.append("all")
+        elif part.isdigit() and int(part) > 0:
+            depths.append(int(part))
+        else:
+            raise ValueError(f"not a depth: {part!r}")
+    return tuple(depths)
+
+
+def _depth(depth: int | str) -> int:
+    return ALL_DEPTH if depth == "all" else int(depth)
 
 
 def query_text(mode: str, text: str) -> str:
@@ -122,9 +142,37 @@ def score(
     return result
 
 
-def run_synthetic(conn, embedder, k: int = 10, per_group: bool = False) -> dict:
+def add_depths(
+    entry: dict,
+    rankings: dict[str, list[str]],
+    relevant: dict[str, set[str]],
+    group: dict[str, str],
+    depths: tuple[int | str, ...],
+    per_group: bool = False,
+) -> dict:
+    """Add macro recall at each depth to a `score` entry (and to its groups when per_group), keyed
+    by the depth as written. MRR and nDCG stay at the entry's own k."""
+    for depth in depths:
+        n = _depth(depth)
+        scored = score(rankings, relevant, group, n, per_group)
+        entry.setdefault("recall_at_depth", {})[str(depth)] = scored[f"recall_at_{n}"]
+        if per_group:
+            for name, metrics in scored["groups"].items():
+                at = entry["groups"][name].setdefault("recall_at_depth", {})
+                at[str(depth)] = metrics[f"recall_at_{n}"]
+    return entry
+
+
+def run_synthetic(
+    conn,
+    embedder,
+    k: int = 10,
+    per_group: bool = False,
+    depths: tuple[int | str, ...] = (),
+) -> dict:
     """Score the indexed corpus against its labels: every ticket whose group has at least two
     members is a query, the rest of its group is relevant, and the ticket itself is excluded.
+    `depths` adds recall at those list depths ("all" = both pools) under "recall_at_depth".
 
     Dense (both e5 prefixes), lexical and fused are scored separately, so the report shows
     whether hybrid retrieval earns its complexity. Aggregates only."""
@@ -140,6 +188,7 @@ def run_synthetic(conn, embedder, k: int = 10, per_group: bool = False) -> dict:
     relevant = {r[0]: members[r[4]] - {r[0]} for r in queries}
     group = {r[0]: r[4] for r in queries}
 
+    deep = max([k, *(_depth(d) for d in depths)])
     modes = {}
     for mode in QUERY_MODES:
         modes[mode] = {}
@@ -148,12 +197,20 @@ def run_synthetic(conn, embedder, k: int = 10, per_group: bool = False) -> dict:
                 ticket_id: [
                     hit.doc_id
                     for hit in retrieve.search(
-                        conn, embedder, query_text(mode, text), k=k, exclude_id=ticket_id, **options
+                        conn,
+                        embedder,
+                        query_text(mode, text),
+                        k=deep,
+                        exclude_id=ticket_id,
+                        **options,
                     )
                 ]
                 for ticket_id, text, *_ in queries
             }
-            modes[mode][name] = score(rankings, relevant, group, k, per_group)
+            entry = score(rankings, relevant, group, k, per_group)
+            if depths:
+                add_depths(entry, rankings, relevant, group, depths, per_group)
+            modes[mode][name] = entry
 
     earlier = {r[0]: (r[2], r[3]) for r in rows}
     with_history = sum(
@@ -219,6 +276,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="synthetic labels only: on real data a group key is a fehlercode",
     )
+    parser.add_argument(
+        "--depths",
+        type=parse_depths,
+        default=(),
+        help="also score recall at these depths, e.g. 10,50,100,all (all = both pools)",
+    )
     args = parser.parse_args(argv)
 
     embedder = HashingEmbedder(dim=index.DIM) if args.embedder == "hashing" else E5Embedder()
@@ -226,7 +289,9 @@ def main(argv: list[str] | None = None) -> int:
     migrate.apply_all(settings.pg_dsn)
     index.build(settings.pg_dsn, rows, embedder, labels=load_labels(args.labels))
     with psycopg.connect(settings.pg_dsn) as conn:
-        report = run_synthetic(conn, embedder, k=args.k, per_group=args.per_group)
+        report = run_synthetic(
+            conn, embedder, k=args.k, per_group=args.per_group, depths=args.depths
+        )
         print(json.dumps(report, indent=2))
     return 0
 
