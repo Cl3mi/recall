@@ -12,8 +12,11 @@ import argparse
 import json
 import math
 import pathlib
+import time
 from collections import defaultdict
 from dataclasses import dataclass
+
+import numpy as np
 
 from insight import extract
 from recall import index, retrieve
@@ -39,6 +42,7 @@ HEAD_WORDS = 8
 # The deepest list there is: two arms of POOL fuse into at most 2 * POOL ids, so recall at this
 # depth is recall over the union of both pools, the ceiling of any rerank over them.
 ALL_DEPTH = 2 * retrieve.POOL
+RERANK_BASE = "fused_query"  # the fused list a reranker reorders, and the variant it must beat
 
 
 def parse_depths(text: str) -> tuple[int | str, ...]:
@@ -163,16 +167,50 @@ def add_depths(
     return entry
 
 
+def _reranked(conn, rerankers, depth, found, asked, relevant, group, k, per_group) -> dict:
+    """One scored entry per reranker and candidate text, from the base variant's hits: nothing
+    is retrieved again. Rerank time per query is reported as p50 and p95 seconds."""
+    texts: dict[str, tuple[str, str]] = {}
+    for hits in found.values():
+        texts.update(retrieve.fetch_texts(conn, [h.doc_id for h in hits[:depth]]))
+    cells = {}
+    for name, reranker in rerankers.items():
+        for doc_text in retrieve.DOC_TEXTS:
+            rankings, seconds = {}, []
+            for ticket_id, hits in found.items():
+                start = time.perf_counter()
+                ordered = retrieve.rerank(
+                    reranker,
+                    retrieve.clean_query(asked[ticket_id]),
+                    hits[:depth],
+                    texts,
+                    doc_text=doc_text,
+                )
+                seconds.append(time.perf_counter() - start)
+                rankings[ticket_id] = [h.doc_id for h in ordered]
+            entry = score(rankings, relevant, group, k, per_group)
+            entry["rerank_seconds"] = {
+                "p50": float(np.percentile(seconds, 50)) if seconds else 0.0,
+                "p95": float(np.percentile(seconds, 95)) if seconds else 0.0,
+            }
+            cells[f"rr_{name}_{doc_text}"] = entry
+    return cells
+
+
 def run_synthetic(
     conn,
     embedder,
     k: int = 10,
     per_group: bool = False,
     depths: tuple[int | str, ...] = (),
+    rerankers: dict | None = None,
+    depth: int | None = None,
 ) -> dict:
     """Score the indexed corpus against its labels: every ticket whose group has at least two
     members is a query, the rest of its group is relevant, and the ticket itself is excluded.
     `depths` adds recall at those list depths ("all" = both pools) under "recall_at_depth".
+    With `rerankers` ({name: Reranker}) and a `depth`, each reranks the fused_query top depth
+    with each candidate text, as cells `rr_<name>_<text>`.
 
     Dense (both e5 prefixes), lexical and fused are scored separately, so the report shows
     whether hybrid retrieval earns its complexity. Aggregates only."""
@@ -188,29 +226,32 @@ def run_synthetic(
     relevant = {r[0]: members[r[4]] - {r[0]} for r in queries}
     group = {r[0]: r[4] for r in queries}
 
-    deep = max([k, *(_depth(d) for d in depths)])
+    if rerankers and (depth is None or depth < k):
+        raise ValueError(f"rerankers need a depth of at least k={k}, got {depth}")
+    deep = max([k, depth or 0, *(_depth(d) for d in depths)])
     modes = {}
     for mode in QUERY_MODES:
         modes[mode] = {}
+        asked = {ticket_id: query_text(mode, text) for ticket_id, text, *_ in queries}
+        base: dict[str, list] = {}
         for name, options in VARIANTS.items():
-            rankings = {
-                ticket_id: [
-                    hit.doc_id
-                    for hit in retrieve.search(
-                        conn,
-                        embedder,
-                        query_text(mode, text),
-                        k=deep,
-                        exclude_id=ticket_id,
-                        **options,
-                    )
-                ]
-                for ticket_id, text, *_ in queries
+            found = {
+                ticket_id: retrieve.search(
+                    conn, embedder, asked[ticket_id], k=deep, exclude_id=ticket_id, **options
+                )
+                for ticket_id in asked
             }
+            if name == RERANK_BASE:
+                base = found
+            rankings = {t: [hit.doc_id for hit in hits] for t, hits in found.items()}
             entry = score(rankings, relevant, group, k, per_group)
             if depths:
                 add_depths(entry, rankings, relevant, group, depths, per_group)
             modes[mode][name] = entry
+        if rerankers:
+            modes[mode].update(
+                _reranked(conn, rerankers, depth, base, asked, relevant, group, k, per_group)
+            )
 
     earlier = {r[0]: (r[2], r[3]) for r in rows}
     with_history = sum(
@@ -221,7 +262,7 @@ def run_synthetic(
         )
         for ticket_id, _text, created, serial, _key in queries
     )
-    return {
+    report = {
         "k": k,
         "embedder": embedder.identity,
         "caveat": CAVEAT,
@@ -230,6 +271,14 @@ def run_synthetic(
         "same_serial_relevant_share": with_history / len(queries) if queries else 0.0,
         "modes": modes,
     }
+    if rerankers:
+        report["rerank"] = {
+            "depth": depth,
+            "base": RERANK_BASE,
+            "models": {name: r.identity for name, r in rerankers.items()},
+            "device": {name: r.device for name, r in rerankers.items()},
+        }
+    return report
 
 
 def load_labels(path: pathlib.Path) -> dict[str, str]:
@@ -263,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     import psycopg
 
     from profiler.gate.embedder import E5Embedder, HashingEmbedder
+    from recall import rerank
     from recall.config import settings
     from recall.db import migrate
 
@@ -282,15 +332,39 @@ def main(argv: list[str] | None = None) -> int:
         default=(),
         help="also score recall at these depths, e.g. 10,50,100,all (all = both pools)",
     )
+    parser.add_argument("--rerankers", type=lambda s: s.split(","), default=[])
+    parser.add_argument("--depth", type=int, help="rerank the fused top DEPTH (with --rerankers)")
+    parser.add_argument(
+        "--e5-device",
+        choices=("cpu", "cuda"),
+        help="where e5 runs; cpu keeps the index the one M3 measured when a GPU is visible",
+    )
     args = parser.parse_args(argv)
+    for name in args.rerankers:
+        if name not in rerank.RERANKERS:
+            parser.error(f"unknown reranker {name!r}")
+    if args.rerankers and args.depth is None:
+        parser.error("--rerankers needs --depth")
+    # Before the embedder and the index: a missing GPU or weights must fail in seconds.
+    rerankers = {name: rerank.RERANKERS[name]() for name in args.rerankers}
 
-    embedder = HashingEmbedder(dim=index.DIM) if args.embedder == "hashing" else E5Embedder()
+    embedder = (
+        HashingEmbedder(dim=index.DIM)
+        if args.embedder == "hashing"
+        else E5Embedder(device=args.e5_device)
+    )
     rows = extract.read_rows(args.corpus)
     migrate.apply_all(settings.pg_dsn)
     index.build(settings.pg_dsn, rows, embedder, labels=load_labels(args.labels))
     with psycopg.connect(settings.pg_dsn) as conn:
         report = run_synthetic(
-            conn, embedder, k=args.k, per_group=args.per_group, depths=args.depths
+            conn,
+            embedder,
+            k=args.k,
+            per_group=args.per_group,
+            depths=args.depths,
+            rerankers=rerankers or None,
+            depth=args.depth,
         )
         print(json.dumps(report, indent=2))
     return 0

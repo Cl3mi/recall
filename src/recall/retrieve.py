@@ -10,7 +10,7 @@ invisible to the retriever, or the metric is circular.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 
 from recall import index
@@ -20,6 +20,7 @@ RRF_K = 60
 ARMS = ("dense", "lexical")
 POOL = 100
 MAX_TERMS = 64
+DOC_TEXTS = ("problem", "problem_solution")  # what a reranker reads of a candidate
 _WORD = re.compile(r"[a-z0-9äöüß_]+")
 
 
@@ -30,6 +31,7 @@ class Hit:
     ranks: dict[str, int] = field(
         default_factory=dict
     )  # arm -> 1-based rank, only arms that found it
+    rerank: float | None = None  # the reranker's score, when one ran
 
 
 def fuse(
@@ -70,6 +72,46 @@ def or_query(text: str | None) -> str:
     return " | ".join(list(words)[:MAX_TERMS])
 
 
+def clean_query(text: str) -> str:
+    """The query as the index sees its own text (index/query symmetry)."""
+    return pipeline.clean(text).text
+
+
+_TEXTS = "select ticket_id, problem_text, solution_text from ticket where ticket_id = any(%(ids)s)"
+
+
+def fetch_texts(conn, ids: list[str]) -> dict[str, tuple[str, str]]:
+    """{ticket id: (problem text, solution text)} for the given ids, in one query."""
+    rows = conn.execute(_TEXTS, {"ids": list(ids)}).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def rerank(
+    reranker,
+    query: str,
+    hits: list[Hit],
+    texts: dict[str, tuple[str, str]],
+    *,
+    doc_text: str,
+) -> list[Hit]:
+    """`hits` reordered by the reranker's score alone, ties kept in fused order.
+
+    `query` must already be cleaned. `doc_text` picks what the reranker reads of a candidate: the
+    problem, or the problem and the solution (an empty solution is sent as None)."""
+    if doc_text not in DOC_TEXTS:
+        raise ValueError(f"unknown doc_text {doc_text!r}")
+    candidates = [
+        (
+            texts[h.doc_id][0],
+            (texts[h.doc_id][1] or None) if doc_text == "problem_solution" else None,
+        )
+        for h in hits
+    ]
+    scores = reranker.score(query, candidates)
+    order = sorted(range(len(hits)), key=lambda i: (-scores[i], i))
+    return [replace(hits[i], rerank=float(scores[i])) for i in order]
+
+
 _FILTER = (
     "(%(exclude)s::text is null or ticket_id <> %(exclude)s) "
     "and (%(before)s::date is null or created < %(before)s)"
@@ -97,6 +139,9 @@ def search(
     before: date | None = None,
     prefix: str = index.QUERY,
     weights: dict[str, float] | None = None,
+    reranker=None,
+    depth: int | None = None,
+    doc_text: str = "problem",
 ) -> list[Hit]:
     """The top k fused hits for text, each carrying its per-arm ranks.
 
@@ -104,12 +149,18 @@ def search(
     an indexed ticket from finding itself when it is the query; before keeps only candidates
     created before that date, so the future cannot leak into the past. prefix is the e5 prefix
     of the query embedding (the stored vectors use "passage: "). weights scales an arm's RRF
-    contribution (see fuse).
+    contribution (see fuse). With a reranker, the fused top `depth` are reordered by its score
+    alone (see rerank) and the top k of that order are returned; without one the result is the
+    fused top k.
     """
     unknown = [arm for arm in arms if arm not in ARMS]
     if unknown:
         raise ValueError(f"unknown arm {unknown[0]!r}")
-    cleaned = pipeline.clean(text).text
+    if reranker is not None and (depth is None or depth < k):
+        raise ValueError(f"a reranker needs a depth of at least k={k}, got {depth}")
+    if doc_text not in DOC_TEXTS:
+        raise ValueError(f"unknown doc_text {doc_text!r}")
+    cleaned = clean_query(text)
     found: dict[str, list[str]] = {}
     params = {"exclude": exclude_id, "before": before, "pool": pool}
     if "dense" in arms and cleaned.strip():
@@ -121,4 +172,8 @@ def search(
         if query:
             rows = conn.execute(_LEXICAL, {**params, "query": query}).fetchall()
             found["lexical"] = [r[0] for r in rows]
-    return fuse(found, limit=k, weights=weights)
+    if reranker is None:
+        return fuse(found, limit=k, weights=weights)
+    hits = fuse(found, limit=depth, weights=weights)
+    texts = fetch_texts(conn, [h.doc_id for h in hits])
+    return rerank(reranker, cleaned, hits, texts, doc_text=doc_text)[:k]
