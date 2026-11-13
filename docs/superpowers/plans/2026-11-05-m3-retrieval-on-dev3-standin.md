@@ -15,13 +15,13 @@ in Python, one scoring core in `src/recall/eval.py`. Spec: `docs/superpowers/spe
 
 ---
 
-## Status (2026-11-11)
+## Status (2026-11-12)
 
 | Task | What | State |
 |---|---|---|
 | 1-7 | index, retrieval, scoring, synthetic wrapper, label loader, query modes | **done**, commits below |
 | 8 | real-data wrapper and Window C | **deferred by design**, needs an operator window (see Task 8) |
-| 9-13 | missing fused variant, per-group metrics, run, fusion decision, M4 gate | **open, start at Task 9** |
+| 9-13 | fused_query variant, per-group metrics, run, fusion decision, M4 gate | **done**; M4 starts with a reranker (Task 13) |
 
 Done commits: `9cbc6d6` migration and builder, `ae352df` fusion, OR-query, metrics, `3707857` search,
 `8232788` synthetic eval, `3641837` label loader and CLI, `2124f77` query modes. Unit tests for these
@@ -370,18 +370,36 @@ def test_a_heavier_arm_outvotes_the_other():
 
 ### Task 13: M4 gate (a decision, not code)
 
-- [ ] **Step 1:** write the M4 start into this plan, from the per-group numbers:
+- [x] **Step 1:** write the M4 start into this plan, from the per-group numbers:
   - twin groups clearly below the others even with the best dense arm: the next plan is a
     **reranker** (GPU time, latency and a model to ship into the sealed environment, so it needs this
     evidence);
   - loss spread evenly across groups: skip the reranker, put the effort into Task 8 (real wrapper,
     Window C) instead.
-- [ ] **Step 2:** if a same-serial boost is wanted, its next plan implements it **behind a flag** and
+- [x] **Step 2:** if a same-serial boost is wanted, its next plan implements it **behind a flag** and
   judges it on real data only. This fixture has 3 vehicles, so its same-serial share is 0.93 by
   construction and would overstate the boost.
-- [ ] **Step 3:** the `fehlercode` arm waits for real data: the stand-in generates codes from a shape
+- [x] **Step 3:** the `fehlercode` arm waits for real data: the stand-in generates codes from a shape
   pattern, so an exact-code arm would look perfect or useless for reasons unrelated to real tickets.
-- [ ] **Step 4:** update the memory entry `m3-standin-eval-2026-11-10` and the handoff, commit docs.
+- [x] **Step 4:** update the memory entry `m3-standin-eval-2026-11-10` and the handoff, commit docs.
+
+**Decision, 2026-11-12 (operator): M4 starts with a reranker.**
+
+- Evidence: the small side of each twin pair scores 0.60 / 0.33 / 0.45 recall@10 (full / title /
+  head) under `fused_query` against 0.95 / 0.98 / 0.98 for the groups without a twin; the best
+  single arm does not close it (dense `query:` 0.62 / 0.33 / 0.38), nor does any fusion weight.
+  MRR on full queries stays high for twins, the shape a reranker addresses. See "Results,
+  2026-11-11" and "Results, 2026-11-12".
+- What the next plan must settle first: whether the twins' relevant tickets are in the candidate
+  list at all. This plan measured recall@10 only; a reranker can only reorder what retrieval returns,
+  so the M4 plan opens by measuring recall at the candidate depth it will rerank (for example 50 or
+  100), on this same fixture so it compares.
+- Its costs, which the plan must budget: GPU time on the shared box (60 GB fair-use cap), query
+  latency, and a model that has to be shipped into the sealed environment.
+- Not chosen: Task 8 first. It stays deferred and is still needed before any quality claim; the
+  reranker is judged on real data there too.
+- Same-serial boost (step 2) and the `fehlercode` arm (step 3) stay out of M4's first plan, as
+  written above.
 
 ## What this plan deliberately does not do
 
