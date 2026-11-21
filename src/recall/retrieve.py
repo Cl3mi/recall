@@ -20,7 +20,7 @@ RRF_K = 60
 ARMS = ("dense", "lexical")
 POOL = 100
 MAX_TERMS = 64
-DOC_TEXTS = ("problem", "problem_solution")  # what a reranker reads of a candidate
+DOC_TEXTS = ("problem_solution",)  # what a reranker reads of a candidate (M4: the one that kept)
 _WORD = re.compile(r"[a-z0-9äöüß_]+")
 
 
@@ -96,17 +96,12 @@ def rerank(
 ) -> list[Hit]:
     """`hits` reordered by the reranker's score alone, ties kept in fused order.
 
-    `query` must already be cleaned. `doc_text` picks what the reranker reads of a candidate: the
-    problem, or the problem and the solution (an empty solution is sent as None)."""
+    `query` must already be cleaned. `doc_text` names what the reranker reads of a candidate; the
+    only text is `problem_solution`, the problem and the solution (an empty solution is sent as
+    None)."""
     if doc_text not in DOC_TEXTS:
         raise ValueError(f"unknown doc_text {doc_text!r}")
-    candidates = [
-        (
-            texts[h.doc_id][0],
-            (texts[h.doc_id][1] or None) if doc_text == "problem_solution" else None,
-        )
-        for h in hits
-    ]
+    candidates = [(texts[h.doc_id][0], texts[h.doc_id][1] or None) for h in hits]
     scores = reranker.score(query, candidates)
     order = sorted(range(len(hits)), key=lambda i: (-scores[i], i))
     return [replace(hits[i], rerank=float(scores[i])) for i in order]
@@ -141,7 +136,7 @@ def search(
     weights: dict[str, float] | None = None,
     reranker=None,
     depth: int | None = None,
-    doc_text: str = "problem",
+    doc_text: str = "problem_solution",
 ) -> list[Hit]:
     """The top k fused hits for text, each carrying its per-arm ranks.
 
@@ -151,7 +146,8 @@ def search(
     of the query embedding (the stored vectors use "passage: "). weights scales an arm's RRF
     contribution (see fuse). With a reranker, the fused top `depth` are reordered by its score
     alone (see rerank) and the top k of that order are returned; without one the result is the
-    fused top k.
+    fused top k. doc_text names what the reranker reads of a candidate (see rerank); it is
+    checked even when no reranker runs.
     """
     unknown = [arm for arm in arms if arm not in ARMS]
     if unknown:

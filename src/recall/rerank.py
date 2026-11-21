@@ -1,9 +1,10 @@
 """Rerankers: score each fused candidate against the query, precision where fusion gave recall.
 
 A reranker reads one query and the candidates' texts and returns one score per candidate, higher
-is more relevant. The real adapters are GPU only (operator, 2026-11-13) and load pinned weights
-offline, like E5Embedder. OverlapReranker is a deterministic stand-in, so retrieval and the eval
-are testable with no torch, no GPU and no download.
+is more relevant. The real adapter (bge-reranker-v2-m3, the M4 pick) is GPU only (operator,
+2026-11-13) and loads pinned weights offline, like E5Embedder. OverlapReranker is a
+deterministic stand-in, so retrieval and the eval are testable with no torch, no GPU and no
+download.
 """
 
 from __future__ import annotations
@@ -72,26 +73,11 @@ def fit(
 
 
 # Pinned like E5_REVISION: a model name without a revision is a claim about whatever the hub
-# served that day. Both Apache-2.0 (master design §12.5).
+# served that day. Apache-2.0 (master design §12.5).
 BGE_MODEL = "BAAI/bge-reranker-v2-m3"
 BGE_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
-QWEN_MODEL = "Qwen/Qwen3-Reranker-4B"
-QWEN_REVISION = "22e683669bc0f0bd69640a1354a6d0aebcfeede5"
 BATCH = 16
 SOLUTION_SEP = "\nLösung: "
-# One fixed instruction, written into the spec before the run and not tuned (operator,
-# 2026-11-13). Only the Qwen model reads it; bge has no instruction slot.
-INSTRUCTION = (
-    "Given a vehicle service ticket, judge whether the candidate ticket describes the same fault "
-    "with the same cause, so its fix applies."
-)
-# The frame from the Qwen3-Reranker model card: the answer is read off the "yes"/"no" logits.
-QWEN_PREFIX = (
-    "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query "
-    'and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n'
-    "<|im_start|>user\n"
-)
-QWEN_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
 def _gpu(torch) -> str:
@@ -113,13 +99,6 @@ def fitted(tokenizer, query: str, candidate: Candidate) -> tuple[list[int], list
         None if solution is None else _ids(tokenizer, solution),
         sep=_ids(tokenizer, SOLUTION_SEP),
     )
-
-
-def qwen_input_ids(tokenizer, query: str, candidate: Candidate) -> list[int]:
-    """One Qwen3-Reranker input: the card's frame around instruction, query and document."""
-    q, doc = fitted(tokenizer, query, candidate)
-    head = _ids(tokenizer, f"{QWEN_PREFIX}<Instruct>: {INSTRUCTION}\n<Query>: ")
-    return head + q + _ids(tokenizer, "\n<Document>: ") + doc + _ids(tokenizer, QWEN_SUFFIX)
 
 
 def bge_input_ids(tokenizer, query: str, candidate: Candidate) -> list[int]:
@@ -169,47 +148,7 @@ class BgeReranker:
         return scores
 
 
-class Qwen3Reranker:
-    """`Qwen/Qwen3-Reranker-4B`: P("yes") at the last position of the card's frame is the score."""
-
-    def __init__(self, model: str = QWEN_MODEL, revision: str = QWEN_REVISION) -> None:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        self._torch = torch
-        self.device = _gpu(torch)
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            model, revision=revision, local_files_only=True, padding_side="left"
-        )
-        self._model = (
-            AutoModelForCausalLM.from_pretrained(
-                model, revision=revision, local_files_only=True, dtype=torch.bfloat16
-            )
-            .eval()
-            .to(self.device)
-        )
-        self._yes = self._tokenizer.convert_tokens_to_ids("yes")
-        self._no = self._tokenizer.convert_tokens_to_ids("no")
-        self.identity = f"qwen3:{model}@{revision}"
-
-    def score(self, query: str, candidates: list[Candidate]) -> list[float]:
-        torch = self._torch
-        scores: list[float] = []
-        for start in range(0, len(candidates), BATCH):
-            inputs = [
-                {"input_ids": qwen_input_ids(self._tokenizer, query, c)}
-                for c in candidates[start : start + BATCH]
-            ]
-            batch = self._tokenizer.pad(inputs, return_tensors="pt")
-            batch = {name: tensor.to(self.device) for name, tensor in batch.items()}
-            with torch.no_grad():
-                last = self._model(**batch).logits[:, -1, :]
-            pair = torch.stack([last[:, self._no], last[:, self._yes]], dim=1).float()
-            scores.extend(torch.log_softmax(pair, dim=1)[:, 1].exp().cpu().tolist())
-        return scores
-
-
-RERANKERS = {"bge": BgeReranker, "qwen3_4b": Qwen3Reranker}
+RERANKERS = {"bge": BgeReranker}
 
 # Synthetic smoke pair: invented text, safe to print.
 SMOKE_QUERY = "Hydraulikpumpe baut keinen Druck auf, Lenkung geht schwer"
@@ -218,7 +157,7 @@ SMOKE_OTHER = ("Klimaanlage kühlt nicht", "Kältemittel nachgefüllt")
 
 
 def main(argv: list[str] | None = None) -> int:
-    """python -m recall.rerank smoke --model bge|qwen3_4b
+    """python -m recall.rerank smoke --model bge
 
     Loads the model offline on the GPU and checks that a same-fault pair outscores an unrelated
     one, with and without the solution. Exit 0 when it does."""

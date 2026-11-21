@@ -30,5 +30,8 @@ CLAUDE.md
 PROJECT_BRIEF.md
 docs/STATE.md
 docs/airlock-runbook.md
+docs/ARCHITECTURE.md
+docs/adr
 docs/NEXT-SESSION-PROMPT.md
 docs/superpowers
+EXPERIMENTS.md
