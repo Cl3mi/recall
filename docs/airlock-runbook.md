@@ -679,7 +679,9 @@ None of these outcomes has been verified by an agent; record what each step prin
    git pull --ff-only && git status --porcelain && git rev-parse HEAD
    ```
 
-   Expected: no status lines, and the commit hash you published in step 7.
+   Expected: no modified tracked files (an untracked tool directory such as `.venv-gen/` is
+   harmless: the image copies only `src/`, `profiler/`, `insight/` and the lock files), and
+   the published snapshot's hash, which differs from the workstation commit.
 
 9. On the box, build the database image:
 
@@ -703,8 +705,9 @@ None of these outcomes has been verified by an agent; record what each step prin
     podman image inspect --format '{{.Id}}' recall/window-c:pinned recall/postgres:18
     ```
 
-    Expected: two `sha256:` IDs. Note them, together with the commit from step 8 and the e5
-    revision above, apart from any client-derived output.
+    Expected: two 64-hex IDs (Podman prints them without Docker's `sha256:` prefix). Note
+    them, together with the commit from step 8 and the e5 revision above, apart from any
+    client-derived output.
 
 12. On the workstation, check the GPU:
 
@@ -724,12 +727,12 @@ None of these outcomes has been verified by an agent; record what each step prin
     Expected: `C_RUNTIME_OK` and `C_REHEARSAL_OK`, exit 0. This proves CUDA through
     `~/bin/podman-gpu` with `--pod`, the pod's shared loopback and tmpfs data and WAL. A
     silent nonzero exit right after the image IDs print most likely means `pod create`
-    rejected `--infra-command`; stop and report the exit code.
+    rejected `--infra-command`; stop and report the exit code (`echo $?`).
 
-14. On the box, confirm nothing survived:
+14. On the box, confirm nothing survived (`podman pod ps` has no `-a`; it lists all pods):
 
     ```bash
-    podman pod ps -aq --filter label=recall.window=c; podman ps -aq --filter label=recall.window=c
+    podman pod ps -q --filter label=recall.window=c; podman ps -aq --filter label=recall.window=c
     ```
 
     Expected: no output.

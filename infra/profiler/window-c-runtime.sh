@@ -45,7 +45,10 @@ trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 PIPE_ID=$("$RUNTIME" image inspect --format '{{.Id}}' "$PIPELINE")
 PG_ID=$("$RUNTIME" image inspect --format '{{.Id}}' "$POSTGRES")
-[[ "$PIPE_ID" == sha256:* && "$PG_ID" == sha256:* ]] || exit 4
+# Docker prints `sha256:<hex>`, Podman the bare 64-hex ID; both name one exact image.
+for id in "$PIPE_ID" "$PG_ID"; do
+  [[ "$id" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { printf 'E_IMAGE_ID\n' >&2; exit 4; }
+done
 T=$THREADS
 C=$(nproc)
 if (( T > C )); then T=$C; fi
