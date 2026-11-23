@@ -725,9 +725,11 @@ None of these outcomes has been verified by an agent; record what each step prin
     ```
 
     Expected: `C_RUNTIME_OK` and `C_REHEARSAL_OK`, exit 0. This proves CUDA through
-    `~/bin/podman-gpu` with `--pod`, the pod's shared loopback and tmpfs data and WAL. A
-    silent nonzero exit right after the image IDs print most likely means `pod create`
-    rejected `--infra-command`; stop and report the exit code (`echo $?`).
+    `~/bin/podman-gpu` with `--pod`, the pod's shared loopback and tmpfs data and WAL.
+    `E_POD` or `E_DATABASE_START` (exit 7) name the step that failed; reproduce it by hand
+    with the same flags to see Podman's own message. The pod's infra container uses the
+    pipeline image, never the Postgres image: that one declares a volume at the data
+    parent, and Podman shares infra mounts with the pod ("duplicate mount destination").
 
 14. On the box, confirm nothing survived (`podman pod ps` has no `-a`; it lists all pods):
 

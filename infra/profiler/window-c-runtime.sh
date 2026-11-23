@@ -73,10 +73,12 @@ fi
 if (( $# == 0 )); then printf 'C_PREFLIGHT_OK\n'; exit 0; fi
 namespace=(--network=none)
 if [[ "$RUNTIME" == podman ]]; then
-  # Reuse the already-pinned Postgres image for the infra sleeper too: no third
-  # pause-image lookup/pull occurs. Native box rehearsal must prove this works.
+  # The infra sleeper reuses the already-pinned pipeline image: no third pause-image
+  # lookup or pull. Never the Postgres image: it declares a volume at the data parent,
+  # and a pod shares its infra mounts, which clashes with the tmpfs (seen on the box).
   podman pod create --name "$POD" --label recall.window=c --network=none \
-    --infra-image "$PG_ID" --infra-command '/usr/bin/sleep infinity' >/dev/null
+    --infra-image "$PIPE_ID" --infra-command '/usr/bin/sleep infinity' >/dev/null 2>&1 ||
+    { printf 'E_POD\n' >&2; exit 7; }
   namespace=(--pod "$POD")
 fi
 "$RUNTIME" run -d --name "$PG" --label recall.window=c --pull=never \
@@ -86,7 +88,8 @@ fi
   -e PGDATA=/var/lib/postgresql/18/docker \
   -e POSTGRES_DB=recall -e POSTGRES_USER=recall -e POSTGRES_PASSWORD=recall_dev_only \
   "$PG_ID" postgres -c logging_collector=off -c log_statement=none \
-  -c log_min_error_statement=panic -c max_parallel_workers=0 >/dev/null 2>&1
+  -c log_min_error_statement=panic -c max_parallel_workers=0 >/dev/null 2>&1 ||
+  { printf 'E_DATABASE_START\n' >&2; exit 7; }
 ready=0
 for (( attempt=0; attempt<60; attempt++ )); do
   if "$RUNTIME" exec "$PG" pg_isready -h 127.0.0.1 -U recall -d recall >/dev/null 2>&1; then
