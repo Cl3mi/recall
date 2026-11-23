@@ -142,3 +142,36 @@ def test_wrapper_fails_closed_when_guard_missing(repo, tmp_path):
     (guard / "guard.py").unlink()
     result = run_wrapper(repo.root, payload(repo, "Read", {"file_path": "x"}), guard)
     assert result.returncode == 2
+
+
+def test_codex_adapter_reports_only_recall_rule_id(monkeypatch):
+    import runpy
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    namespace = runpy.run_path(str(Path(__file__).resolve().parents[2] / ".codex/claude-guard.py"))
+    reason = "recall guard [lint]: secret client path and payload"
+    response = {"hookSpecificOutput": {"permissionDecision": "deny",
+                                      "permissionDecisionReason": reason}}
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=json.dumps(response)))
+    with pytest.raises(namespace["Denied"], match=r"operation \[lint\]") as exc:
+        namespace["run_guard"](["/bin/bash", "guard"], {"cwd": str(Path.cwd())},
+                               Path.cwd(), source="recall")
+    assert "secret" not in str(exc.value)
+
+
+def test_codex_adapter_keeps_machine_denial_generic(monkeypatch):
+    import runpy
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    namespace = runpy.run_path(str(Path(__file__).resolve().parents[2] / ".codex/claude-guard.py"))
+    response = {"hookSpecificOutput": {"permissionDecision": "deny",
+                                      "permissionDecisionReason": "secret client path"}}
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=json.dumps(response)))
+    with pytest.raises(namespace["Denied"], match="client-data guard denied") as exc:
+        namespace["run_guard"](["/usr/bin/python3", "guard"],
+                               {"cwd": str(Path.cwd())}, Path.cwd())
+    assert "secret" not in str(exc.value)

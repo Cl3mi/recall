@@ -22,6 +22,9 @@ HOST="${RECALL_WINDOW_HOST:-hpc}"
 # placeholder keeps --dry-run working and makes a real run refuse (see below).
 QUARANTINE="${RECALL_WINDOW_QUARANTINE:-<data-dir>/recall-quarantine}"
 IMAGE="${RECALL_WINDOW_IMAGE:-recall/profiler:pinned}"
+IMAGE_SET=0
+[[ -n "${RECALL_WINDOW_IMAGE:-}" ]] && IMAGE_SET=1
+PG_IMAGE="${RECALL_WINDOW_C_PG_IMAGE:-recall/postgres:18}"
 # Thread cap for the sealed run. Measured 2026-09-07 on the box (finding 17): on real-length
 # documents 32 threads gave 2.08 docs/s but 128 gave 1.10 - roughly HALF - because the box sits
 # at load ~200 of 256 with other users and oversubscription turns into context switching.
@@ -82,6 +85,7 @@ image_digest() { docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null ||
 #         Per-window on purpose: Window A profiles text and has no use for one, and a window
 #         holding a card it does not need is unfair on a box with other users.
 window_contract() {
+  WINDOW_POD=0
   case "$1" in
     a)
       WINDOW_NAME="Window A - profiling"
@@ -135,13 +139,11 @@ window_contract() {
       WINDOW_OUT=(eval_real.json)
       WINDOW_REVIEW="eval_real.json"
       WINDOW_SHRED=(export.csv profiler_detail.log eval_queries.json
-                    enrichment_state.jsonl vllm.log)
-      # Window C runs vLLM and will want a GPU, but its command block is unwritten and its
-      # controls are not settled, so it claims nothing yet.
-      WINDOW_GPU=""
-      # Written at the start of M4. Overnight unattended run of the whole offline
-      # pipeline; every stage must already be proven on synthetic data first.
-      WINDOW_CMD=''
+                    enrichment_state.jsonl vllm.log eval_real.json eval_real.json.tmp window_c.log)
+      WINDOW_GPU=0
+      WINDOW_POD=1
+      (( IMAGE_SET )) || IMAGE=recall/window-c:pinned
+      WINDOW_CMD='python -m recall.window_c --csv /q/export.csv --out eval_real.json'
       ;;
     d)
       WINDOW_NAME="Window D - insight report (stage 1)"
@@ -225,6 +227,8 @@ Drive an airlock window end to end.
 Commands
   ship          docker save the sealed image, podman load it on the box, verify it
                 runs offline there
+                (window c: verify the two images already built on the box)
+  preflight     window c only: run the offline embedder and GPU check before staging
   push          preflight the export (shape only, never its content) and copy it to
                 quarantine as export.csv
   run           run this window's command on the box, sealed with --network=none
@@ -232,12 +236,14 @@ Commands
                 internal network, torn down on any exit, then a leak check with no network)
   verify        on-box sanity checks that silently cost a cycle when wrong
   leakcheck     window e only: re-run the leak check on the draft after you edited it
-  release       window e only: write catalog.json, only if the report passed for the
-                exact draft (runs with --network=none)
+  release       window e: write catalog.json only if its report passed for the exact
+                draft (runs with --network=none); window c: validate and export the
+                reviewed numeric eval_real.json aggregate
   fetch        copy back ONLY this window's allowlisted artifacts
   clean         shred this window's sensitive files on the box
   status        list what is currently sitting in quarantine
   all           ship + push + run + verify, then STOP at the human review gate
+                (window c requires explicit steps; all is refused)
 
 Options
   --window a|b|c|d|e  which window (default: a)
@@ -245,6 +251,8 @@ Options
   --host HOST       (default: hpc, or $RECALL_WINDOW_HOST)
   --quarantine DIR  (default: $RECALL_WINDOW_QUARANTINE; required for a real run)
   --image REF       (default: recall/profiler:pinned)
+                    window c default: recall/window-c:pinned; PG image from
+                    RECALL_WINDOW_C_PG_IMAGE (default: recall/postgres:18)
   --threads N       CPU cap for the sealed run (default: 32, or $RECALL_WINDOW_THREADS).
                     32 measured ~2x faster than 128 on the shared box; uncapped takes all
                     256 and is slower still. Raise it only on a quiet box.
@@ -266,6 +274,8 @@ The review gate
   `fetch --clean` yourself. Nothing is copied back until you have looked at it.
   Window e: read catalog.draft.json AND catalog.leak_report.json in full on the box, run
   `leakcheck` again if you edited the draft, then `release`, then `fetch --clean`.
+  Window c: preflight, push, run, verify, review eval_real.json on the box, fetch, release,
+  then clean. C refuses `all` and `fetch --clean`.
 
 Examples
   infra/profiler/window.sh --csv ~/work/<export-dir>/<export-file> all
@@ -281,6 +291,11 @@ cmd_ship() {
   [[ -n "$(git status --porcelain)" ]] &&
     die "working tree is dirty - the image would not correspond to any commit"
   ok "tree clean at $(git rev-parse --short HEAD)"
+  if [[ "$WINDOW" == c ]]; then
+    remote "podman image inspect --format '{{.Id}}' $IMAGE $PG_IMAGE" || die "E_C_IMAGES"
+    info "C images are built from the clean published checkout on the box; run preflight next"
+    return 0
+  fi
 
   if (( DRY_RUN )); then
     info "dry-run: docker save $IMAGE | ssh $HOST 'podman load'"
@@ -388,6 +403,10 @@ cmd_run() {
     cmd_run_e "$device_arg"
     return 0
   fi
+  if [[ "$WINDOW" == c ]]; then
+    cmd_run_c "$device_arg"
+    return 0
+  fi
 
   # ulimit -c 0 is a data-safety control, not tidiness: a core dump written on the box
   # would contain ticket text straight out of memory, and it would outlive the window.
@@ -415,6 +434,148 @@ cmd_run() {
 
   remote "$run_cmd" || die "the sealed run failed - read $QUARANTINE/profiler_detail.log ON THE BOX"
   ok "sealed run completed"
+}
+
+# C's local operations run only for the operator; tests provide synthetic roots.
+# No arbitrary filenames or row-bearing output can cross this interface.
+c_local() {
+  "${RECALL_WINDOW_PYTHON:-.venv/bin/python}" - "$1" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+from recall.eval_real import validate_report
+from recall.sealed import sealed_path
+
+try:
+    action = sys.argv[1]
+    if action in ("invalidate", "invalidate-release"):
+        Path("local/released/eval_real.json").unlink(missing_ok=True)
+    if action == "invalidate-release":
+        sys.exit(0)
+    final = sealed_path("eval_real.json")
+    temporary = sealed_path("eval_real.json.tmp")
+    if action == "path":
+        print(final)
+    elif action == "validate":
+        if not validate_report(json.loads(final.read_text())):
+            sys.exit(2)
+    elif action in ("invalidate", "clean"):
+        paths = [final, temporary]
+        paths += list(final.parent.glob(".eval_real.json.*.tmp"))
+        paths += list(final.parent.glob(".eval_real.json.tmp.*.tmp"))
+        for path in paths:
+            if path.is_symlink() or (path.exists() and path.stat().st_nlink > 1):
+                path.unlink()
+            elif path.exists():
+                subprocess.run(["shred", "-u", "--", str(path)], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if any(path.exists() or path.is_symlink() for path in paths):
+            sys.exit(4)
+    else:
+        sys.exit(4)
+except SystemExit:
+    raise
+except BaseException:
+    sys.exit(4)
+PY
+}
+
+cmd_run_c() {
+  local device_arg="$1" uuid command="$WINDOW_CMD" script
+  uuid=${device_arg#--device nvidia.com/gpu=}
+  if (( DRY_RUN )); then uuid=GPU-CLAIMED-AT-RUN-TIME; fi
+  [[ "$uuid" =~ ^GPU-[A-Za-z0-9-]+$ ]] || die "E_C_GPU_CLAIM"
+  if [[ "${C_PREFLIGHT:-0}" == 1 ]]; then
+    command=""
+  elif (( DRY_RUN )); then
+    info "invalidate old C release and staged sealed report before the new run"
+  else
+    c_local invalidate || die "E_C_INVALIDATE"
+  fi
+  info "WINDOW_POD=1; immutable image IDs resolved before any data mount"
+  script=$(cat infra/profiler/window-c-runtime.sh)
+  remote "bash -s -- podman '$QUARANTINE' '$IMAGE' '$PG_IMAGE' '$THREADS' '$uuid' $command <<'RECALL_WINDOW_C'
+$script
+RECALL_WINDOW_C" || die "E_C_RUN"
+  ok "C completed; runtime torn down"
+}
+
+cmd_verify_c() {
+  remote "podman run --rm --pull=never --network=none --read-only --tmpfs /tmp:rw,nosuid,nodev --ulimit core=0 --log-driver=none -v $QUARANTINE:/q:ro $IMAGE python -c \"import json,sys; from recall.eval_real import validate_report; sys.exit(0 if validate_report(json.load(open('/q/eval_real.json'))) else 2)\" >/dev/null 2>&1" || die "E_C_REPORT"
+  ok "C report matches the frozen numeric schema"
+}
+
+cmd_fetch_c() {
+  bold "Retrieve C aggregate into sealed staging"
+  info "The runbook requires eval_real.json to be read in full, ON THE BOX, before copying"
+  if (( DO_CLEAN )); then die "C requires fetch, release, then clean as separate steps"; fi
+  if (( DRY_RUN )); then
+    info "destination from recall.sealed.sealed_path('eval_real.json'); old C release invalidated"
+    info "dry-run: scp $HOST:$QUARANTINE/eval_real.json <staged sealed report>"
+    return 0
+  fi
+  # --yes deliberately cannot approve this review gate.
+  local reply destination
+  printf 'Have you read the whole eval_real.json on the box? [y/N] '
+  read -r reply || die "E_C_REVIEW"
+  [[ "$reply" == [yY] ]] || die "E_C_REVIEW"
+  cmd_verify_c
+  c_local invalidate || die "E_C_INVALIDATE"
+  destination=$(c_local path) || die "E_C_STAGE"
+  if ! scp -q "$HOST:$QUARANTINE/eval_real.json" "$destination"; then
+    c_local invalidate || true
+    die "E_C_FETCH"
+  fi
+  if ! c_local validate; then c_local invalidate || true; die "E_C_REPORT"; fi
+  ok "eval_real.json -> staged sealed report; run release next"
+}
+
+cmd_release_c() {
+  if (( DRY_RUN )); then
+    info "invalidate old C release; recheck validate_report on staged sealed report"
+    info "dry-run: python3 tools/guard/export_aggregate.py eval_real"
+    return 0
+  fi
+  c_local invalidate-release || die "E_C_INVALIDATE"
+  c_local validate || die "E_C_REPORT"
+  if ! "${RECALL_WINDOW_PYTHON:-.venv/bin/python}" tools/guard/export_aggregate.py eval_real; then
+    c_local invalidate-release || true
+    die "E_C_RELEASE"
+  fi
+  ok "C aggregate released; clean both locations before closing the airlock"
+}
+
+cmd_clean_c() {
+  local f targets=""
+  for f in "${WINDOW_SHRED[@]}"; do targets+=" $QUARANTINE/$f"; done
+  targets+=" $QUARANTINE/.eval_real.json.*.tmp $QUARANTINE/.eval_real.json.tmp.*.tmp"
+  info "shred staged sealed report and C's explicit remote outputs/inputs/logs"
+  confirm "Proceed with C cleanup?" || die "E_C_CANCELLED"
+  if (( ! DRY_RUN )); then c_local clean || die "E_C_LOCAL_CLEAN"; fi
+  # Each check exits explicitly: set -e ignores failures inside && lists and loops, and a
+  # failing podman inside \$(...) would otherwise read as \"nothing left\". Links are removed,
+  # never shredded, since shred would overwrite whatever they point to.
+  remote "set -e
+for f in $targets; do
+  if [ -L \"\$f\" ] || { [ -e \"\$f\" ] && [ \"\$(stat -c %h -- \"\$f\")\" -gt 1 ]; }; then
+    rm -f -- \"\$f\"
+  elif [ -e \"\$f\" ]; then
+    shred -u -- \"\$f\" >/dev/null 2>&1
+  fi
+done
+pods=\$(podman pod ps -q --filter label=recall.window=c)
+for id in \$pods; do podman pod rm -f \"\$id\" >/dev/null; done
+containers=\$(podman ps -aq --filter label=recall.window=c)
+for id in \$containers; do podman rm -fv \"\$id\" >/dev/null; done
+for f in $targets; do
+  if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then exit 1; fi
+done
+pods=\$(podman pod ps -q --filter label=recall.window=c)
+[ -z \"\$pods\" ] || exit 1
+containers=\$(podman ps -aq --filter label=recall.window=c)
+[ -z \"\$containers\" ] || exit 1" || die "E_C_CLEAN"
+  ok "C cleanup verified; sealed markers and released aggregate preserved"
 }
 
 # A catalog container with NO network: used for leakcheck and release, which need real rows or
@@ -522,6 +683,7 @@ cmd_leakcheck() {
 # The only way a catalog is made: catalog.release_gate refuses unless the report passed for the
 # exact bytes of the draft. --network=none because releasing needs no model and no network.
 cmd_release() {
+  if [[ "$WINDOW" == c ]]; then cmd_release_c; return; fi
   [[ "$WINDOW" == e ]] || die "'release' is only for window e"
   bold "Release the catalog (no network)"
   remote "ulimit -c 0; $(catalog_sealed "$(release_args)")" ||
@@ -531,6 +693,7 @@ cmd_release() {
 
 cmd_verify() {
   bold "On-box verification"
+  if [[ "$WINDOW" == c ]]; then cmd_verify_c; return; fi
   # Counts and verdicts only - this prints nothing derived from a row's content.
   if [[ "$WINDOW" == e ]]; then
     # Never prints a value: the recipe count, each check's name with ok/FAILED and its failure
@@ -611,6 +774,7 @@ EOF
 }
 
 cmd_fetch() {
+  if [[ "$WINDOW" == c ]]; then cmd_fetch_c; return; fi
   bold "Retrieve artifacts"
   cat <<EOF
   The runbook requires $WINDOW_REVIEW to be read in full, ON THE BOX, before
@@ -644,6 +808,7 @@ EOF
 
 cmd_clean() {
   bold "Shred what must not survive the window"
+  if [[ "$WINDOW" == c ]]; then cmd_clean_c; return; fi
   local f targets=()
   for f in "${WINDOW_SHRED[@]}"; do targets+=("$QUARANTINE/$f"); done
 
@@ -671,6 +836,7 @@ cmd_status() {
 }
 
 cmd_all() {
+  [[ "$WINDOW" != c ]] || die "C uses explicit preflight, push, run, verify, fetch, release, clean steps"
   cmd_ship
   echo
   cmd_push
@@ -713,7 +879,7 @@ while (( $# )); do
     --csv)        CSV="${2:?--csv needs a value}"; shift 2 ;;
     --host)       HOST="${2:?--host needs a value}"; shift 2 ;;
     --quarantine) QUARANTINE="${2:?--quarantine needs a value}"; shift 2 ;;
-    --image)      IMAGE="${2:?--image needs a value}"; shift 2 ;;
+    --image)      IMAGE="${2:?--image needs a value}"; IMAGE_SET=1; shift 2 ;;
     --threads)    THREADS="${2:?--threads needs a value}"; shift 2 ;;
     --clean)      DO_CLEAN=1; shift ;;
     --yes|-y)     ASSUME_YES=1; shift ;;
@@ -729,6 +895,15 @@ done
 [[ -n "$COMMAND" ]] || { usage; exit 1; }
 
 window_contract "$WINDOW"
+if [[ "$WINDOW" == c ]] && (( ! DRY_RUN )); then
+  umask 077
+  [[ "$THREADS" =~ ^[1-9][0-9]*$ ]] || die "E_C_ARGUMENT"
+  [[ "$QUARANTINE" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || die "E_C_ARGUMENT"
+  [[ "$HOST" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "E_C_ARGUMENT"
+  for ref in "$IMAGE" "$PG_IMAGE"; do
+    [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9/:@._-]*$ ]] || die "E_C_ARGUMENT"
+  done
+fi
 if (( ! DRY_RUN )) && [[ "$QUARANTINE" == *"<"* ]]; then
   die "quarantine path is still the placeholder: export RECALL_WINDOW_QUARANTINE=/data/<box-user>/recall-quarantine (your writable per-user directory on the box) or pass --quarantine"
 fi
@@ -749,6 +924,7 @@ fi
 (( DRY_RUN )) && bold "DRY RUN - nothing will be changed on $HOST"
 
 case "$COMMAND" in
+  preflight) [[ "$WINDOW" == c ]] || die "preflight is C-only"; C_PREFLIGHT=1; cmd_run ;;
   ship)   cmd_ship ;;
   push)   cmd_push ;;
   run)    cmd_run ;;

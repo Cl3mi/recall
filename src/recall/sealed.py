@@ -8,8 +8,10 @@ tools/guard/export_aggregate.py.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 # Mirrored by tools/guard/recall_guard/config.py; a test keeps the two equal.
@@ -48,6 +50,23 @@ def sealed_path(name: str) -> Path:
     target = root / relative
     _mark(target.parent)
     return target
+
+
+def sealed_atomic_json(name: str, value: object) -> Path:
+    """Atomically write JSON inside the sealed root; never expose a partial final file."""
+    destination = sealed_path(name)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, allow_nan=False, sort_keys=True)
+            handle.write("\n")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 def sealed_logger(name: str, level: int = logging.INFO) -> logging.Logger:

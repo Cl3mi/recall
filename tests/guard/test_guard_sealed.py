@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 
@@ -58,3 +59,26 @@ def test_sealed_logger_writes_into_sealed_root(tmp_path, monkeypatch):
     assert log.propagate is False
     assert len(sealed.sealed_logger("profiler-detail").handlers) == 1  # no duplicate handlers
     logging.getLogger("recall.sealed.profiler-detail").handlers.clear()
+
+
+def test_sealed_atomic_json_publishes_complete_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_SEALED_ROOT", str(tmp_path / "sealed"))
+    destination = sealed.sealed_atomic_json("eval_real.json", {"count": 2})
+    assert destination == tmp_path / "sealed" / "eval_real.json"
+    assert json.loads(destination.read_text()) == {"count": 2}
+    assert not list((tmp_path / "sealed").glob("*.tmp"))
+
+
+def test_sealed_atomic_json_cleans_partial_temp_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_SEALED_ROOT", str(tmp_path / "sealed"))
+    with pytest.raises(TypeError):
+        sealed.sealed_atomic_json("eval_real.json", {"invalid": object()})
+    assert not (tmp_path / "sealed" / "eval_real.json").exists()
+    assert not list((tmp_path / "sealed").glob("*.tmp"))
+
+
+def test_sealed_atomic_json_rejects_escape(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_SEALED_ROOT", str(tmp_path / "sealed"))
+    with pytest.raises(ValueError):
+        sealed.sealed_atomic_json("../escape.json", {"count": 2})
+    assert not (tmp_path / "escape.json").exists()

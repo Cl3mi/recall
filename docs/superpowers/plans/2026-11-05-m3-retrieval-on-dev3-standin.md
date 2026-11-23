@@ -68,6 +68,8 @@ those gaps.
   window and a catalog decision (see the handoff doc). Two rules carry over:
   `run_synthetic`-style per-group output must stay **off** on real data (a group key there is a
   `fehlercode`), and `eval_real.json` stays aggregates only with a key-set pin test.
+  Draft continuation plan prepared 2026-11-16:
+  `docs/superpowers/plans/2026-11-16-m3-window-c.md` (operator review pending; no real run yet).
 
 ## Tasks 9-13 (open)
 

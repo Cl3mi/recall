@@ -51,6 +51,10 @@ window-a-rehearsal:
 window-b-rehearsal:
 	./infra/profiler/rehearse-window-b.sh
 
+.PHONY: window-c-rehearsal
+window-c-rehearsal:
+	bash infra/profiler/rehearse-window-c.sh
+
 window-d-rehearsal:
 	./infra/profiler/rehearse-window-d.sh
 

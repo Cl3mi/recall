@@ -571,23 +571,201 @@ First, whatever fails: the model server and the network are removed automaticall
 - Never publish a port, never replace `--internal` with a normal network, never mount quarantine into
   the model container, never switch off `--log-driver=none`.
 
-## Window C — real-data eval (command block written at the start of M4)
+## Window C — temporal retrieval baseline
 
-Controls that must be in it, decided now:
+**Implementation verification is incomplete: do not stage real rows yet.** The approved
+M3 spec limits this window to ingest → index → eval, with no enrichment, LLM, synthesis,
+or reranker comparison. The catalog/relevance prerequisite still needs operator review.
+The first baseline uses exact normalized composite `fehlercode` labels, not a catalog.
 
-- This window runs the **entire offline pipeline**: clean → enrich → embed → index
-  → eval. It is an overnight unattended run, so every stage must already be proven
-  on synthetic data.
-- vLLM starts with `--disable-log-requests` and its logs go to
-  `<data-dir>/recall-quarantine/`. Default verbosity puts prompt text in the log, and a
-  log file nobody remembers to shred is a leak that outlives the window.
-- Postgres for this window runs with its data directory on **tmpfs**, so real rows
-  never touch disk, and is destroyed with `podman rm -v`. `DROP TABLE` leaves the
-  volume and the WAL behind.
-- Enrichment intermediate state — needed for resumability — lives under
-  `<data-dir>/recall-quarantine/`. It is a distilled summary of real tickets and is
-  arguably more sensitive than the source rows.
-- The hand-written eval queries are real data. They are created on the box, used on
-  the box, and shredded there. Only `eval_real.json` crosses out, keyed by **opaque
-  query ids** — never by query text.
-- Teardown shreds: CSV, queries, enrichment state, vLLM logs, tmpfs volume, detail log.
+`recall.window_c` fixes e5 and the disposable loopback DSN, requires `RECALL_WINDOW_C=1`,
+and accepts only `--out eval_real.json`, resolved through `recall.sealed`. Input identity
+checks precede stale-output removal. CLI codes: 0 success; 2 invalid report; 3 unexpected
+failure/cancellation; 4 bad arguments/input. Public diagnostics and `window_c.log` contain
+fixed codes only. Report validation precedes sealed atomic publication.
+
+Postgres and worker share isolated loopback in a `--network=none` Podman pod. Database
+data and WAL live below tmpfs `/var/lib/postgresql` (the Postgres 18 volume parent), with
+no anonymous persistent volumes. The worker rootfs is read-only; scratch is tmpfs. No
+repository, home, model-cache or socket mount is accepted. The only persistent writable
+mount is sealed `/q`. Both runtime logs are discarded and core dumps disabled. The runtime
+uses local immutable image IDs, never pulls, and tears down on success, failure and signals.
+The native GPU wrapper must support `--pod`; if rehearsal fails, stop for operator maintenance.
+
+Before staging, verify host swap/tmpfs arrangements meet the no-disk requirement, book an
+AI-free window, review the concrete isolation/fetch/shred controls, and obtain green local
+and native box rehearsals. Record git revision, both immutable image IDs and the e5 revision
+`3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3` separately from client-derived output. Pin those
+exact image IDs through `RECALL_WINDOW_IMAGE` and `RECALL_WINDOW_C_PG_IMAGE` for the window.
+GPU preflight must pass before staging, and the run repeats it before mounting any input.
+
+### Operator-only synthetic verification, before booking
+
+These commands create no client input. Never build an image with the whole workstation
+checkout as its context: `local/` holds client files and would be sent to the builder.
+On the workstation, steps 3–4 copy only git-tracked code into a scratch context. On the box,
+build from a clean published checkout. Publication stays the operator's `make publish`.
+None of these outcomes has been verified by an agent; record what each step printed.
+
+**Workstation (Docker), from the repository root**
+
+1. Start the development database (this also builds `recall/postgres:18` locally):
+
+   ```bash
+   make db-up
+   ```
+
+   Expected: the `recall-db-1` container reports healthy.
+
+2. Run the Window C integration tests against that synthetic database:
+
+   ```bash
+   PG_DSN=postgresql://recall:recall_dev_only@localhost:5433/recall .venv/bin/python -m pytest tests/integration/test_eval_real.py -p no:cacheprovider
+   ```
+
+   Expected: `10 passed`. This covers the SQL cutoff in every variant, the unscored count,
+   the missing-label anchor, the dense pool behind more than 40 holdout neighbours (HNSW
+   forced) and the CLI end to end.
+
+3. Copy only tracked code into a scratch build context:
+
+   ```bash
+   rm -rf /tmp/recall-c-context && mkdir /tmp/recall-c-context && git ls-files -z src profiler insight infra/eval pyproject.toml uv.lock | xargs -0 cp --parents -t /tmp/recall-c-context
+   ```
+
+   Expected: no output; `/tmp/recall-c-context` holds `src/`, `profiler/`, `insight/`,
+   `infra/eval/`, `pyproject.toml` and `uv.lock`, and nothing from `local/`.
+
+4. Build the offline worker image from that context (e5 weights download at build time):
+
+   ```bash
+   docker build -f /tmp/recall-c-context/infra/eval/Dockerfile.window-c -t recall/window-c:pinned /tmp/recall-c-context
+   ```
+
+   Expected: the build ends successfully after the self-check (CUDA-enabled torch, offline
+   imports, one 1024-wide embedding of an invented sentence).
+
+5. Run the synthetic rehearsal:
+
+   ```bash
+   make window-c-rehearsal
+   ```
+
+   Expected: `pipeline_image=sha256:…` and `postgres_image=sha256:…`, then `C_RUNTIME_OK`
+   and `C_REHEARSAL_OK`, exit 0. e5 runs on CPU without a GPU. `E_STALE_IMAGE` means the
+   image and the checkout differ: repeat steps 3–4.
+
+6. Confirm nothing from the rehearsal survived:
+
+   ```bash
+   docker ps -aq --filter label=recall.window=c
+   ```
+
+   Expected: no output.
+
+**Box (Podman, GPU), after the reviewed code is committed and published**
+
+7. On the workstation, publish the reviewed commit:
+
+   ```bash
+   make publish
+   ```
+
+   Expected: the publish scan passes and the snapshot is pushed.
+
+8. On the box, in the clean published checkout, update and confirm it is clean:
+
+   ```bash
+   git pull --ff-only && git status --porcelain && git rev-parse HEAD
+   ```
+
+   Expected: no status lines, and the commit hash you published in step 7.
+
+9. On the box, build the database image:
+
+   ```bash
+   podman build -t recall/postgres:18 infra/postgres
+   ```
+
+   Expected: a successful build with pgvector and the German compound dictionaries.
+
+10. On the box, build the worker image:
+
+    ```bash
+    podman build -f infra/eval/Dockerfile.window-c -t recall/window-c:pinned .
+    ```
+
+    Expected: a successful build, with the same self-check as step 4.
+
+11. On the box, record the pins:
+
+    ```bash
+    podman image inspect --format '{{.Id}}' recall/window-c:pinned recall/postgres:18
+    ```
+
+    Expected: two `sha256:` IDs. Note them, together with the commit from step 8 and the e5
+    revision above, apart from any client-derived output.
+
+12. On the workstation, check the GPU:
+
+    ```bash
+    bash infra/fairuse/gpu-fairuse2.sh claim 0
+    ```
+
+    Expected: GO and an export line containing `GPU=nvidia.com/gpu=GPU-…`. DEFER means
+    wait and retry later.
+
+13. On the box, run the native rehearsal with the UUID from step 12:
+
+    ```bash
+    bash infra/profiler/rehearse-window-c.sh --runtime podman --gpu GPU-<uuid-from-step-12>
+    ```
+
+    Expected: `C_RUNTIME_OK` and `C_REHEARSAL_OK`, exit 0. This proves CUDA through
+    `~/bin/podman-gpu` with `--pod`, the pod's shared loopback and tmpfs data and WAL. A
+    silent nonzero exit right after the image IDs print most likely means `pod create`
+    rejected `--infra-command`; stop and report the exit code.
+
+14. On the box, confirm nothing survived:
+
+    ```bash
+    podman pod ps -aq --filter label=recall.window=c; podman ps -aq --filter label=recall.window=c
+    ```
+
+    Expected: no output.
+
+### Real-window sequence remains operator-only
+
+After the synthetic gates pass, prepare the final numbered real-window command blocks
+with the actual pins and reviewed paths. Those commands remain pending; this draft is
+not authorization to stage data. Open the workstation airlock before staging. The C
+steps are preflight → push → run → verify → full report review on the box → fetch →
+release → clean → verify both locations and runtime teardown → close the airlock last.
+Use explicit steps: C refuses `all` and `fetch --clean` to preserve release-before-clean.
+
+C fetch copies **only** `eval_real.json` into workstation sealed staging obtained from
+`sealed_path`, never into `local/artifacts`. `--yes` cannot approve C's review gate.
+Local exact-schema validation precedes the unchanged aggregate exporter; failed validation
+or export cannot leave an earlier release presented as the new result. A new run invalidates
+the previous C release and staged report before fallible runtime work.
+
+Cleanup shreds the staged report plus the remote input, report, legacy fixed temp, coded
+log and the helper's narrowly scoped `.eval_real.json.*.tmp` / `.eval_real.json.tmp.*.tmp`
+files. Existing detail/query/enrichment/vLLM cleanup entries remain. C-labeled runtime
+objects are removed and checked absent. Sealed markers, other windows' artifacts and
+the approved released aggregate remain.
+
+Cancelling `window.sh` on the workstation (Ctrl-C, a closed terminal, a dropped SSH link)
+does **not** stop the run on the box: SSH without a terminal sends the remote shell no
+hangup. A signal delivered on the box tears the pod down at once. After any local cancel,
+run C's `clean` step; it removes every `recall.window=c` pod and container and fails if one
+remains. Do not close the airlock until that step reports verified cleanup.
+
+On failure, abort and clean while AI stays off;
+read codes yourself and describe the problem only after verified cleanup and airlock close.
+
+Report coverage and scorable counts before interpreting metrics. Same-code relevance
+measures coded faults only; multi-code strings remain one composite label. Empty solutions
+remain candidates, so this is not a measure of usable fixes. `mrr` means MRR@10 here;
+recall divides by min(10, relevant count), and metrics are macro-averaged by code group.
+No scorable queries means no quality conclusion; do not infer performance on uncoded tickets.
