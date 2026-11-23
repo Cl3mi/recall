@@ -748,6 +748,68 @@ steps are preflight → push → run → verify → full report review on the bo
 release → clean → verify both locations and runtime teardown → close the airlock last.
 Use explicit steps: C refuses `all` and `fetch --clean` to preserve release-before-clean.
 
+#### Draft command blocks (not authorization to stage data)
+
+Pins, recorded 2026-11-23 from the green native box rehearsal: published `main@514d8de`
+(source `226b98b`), pipeline image `7a8e5017edd6464302b0759441504df81d515301f51ccbc4674e5a3eecb41c72`,
+postgres image `1156b73510303a2d33f15650f2eeefb42f8bc7fd649f502d5cd8c895f40ac3bf`, e5 revision
+`3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3`. Later docs- or tests-only commits may be published
+on top; if either image ID, the e5 revision or anything under `src/recall`, `profiler` or
+`insight` differs on the day, stop and re-rehearse.
+The box shell is bash (`$?`); every GPU UUID starts with `GPU-`.
+
+Before booking (AI assistance fine, no real data present):
+- [ ] Catalog/relevance prerequisite signed off (normalized composite `fehlercode` labels).
+- [ ] Isolation, fetch and shred controls reviewed; host swap/tmpfs arrangement checked.
+- [ ] AI-free window booked; the box checkout is the published commit above.
+- [ ] Workstation tree clean (`git status --porcelain` prints nothing): `ship` refuses otherwise.
+
+The window, all on the workstation from the repo root unless marked **box**:
+
+1. 🔒 `tools/guard/airlock open`, then `tools/guard/airlock status` shows open.
+2. Pin the images and the quarantine for this shell:
+
+       export RECALL_WINDOW_IMAGE=\
+       7a8e5017edd6464302b0759441504df81d515301f51ccbc4674e5a3eecb41c72
+       export RECALL_WINDOW_C_PG_IMAGE=\
+       1156b73510303a2d33f15650f2eeefb42f8bc7fd649f502d5cd8c895f40ac3bf
+       export RECALL_WINDOW_QUARANTINE=<data-dir>/recall-quarantine
+
+3. Check both images on the box: `infra/profiler/window.sh --window c ship` → `tree clean at …`,
+   the two image IDs from the pins, then `C images are built …; run preflight next`. It refuses
+   a dirty workstation tree, untracked files included.
+4. GPU and offline embedder before any data: `infra/profiler/window.sh --window c preflight`
+   → `fairuse claimed GPU 0 (GPU-…)` and no `E_` code. "fairuse refused" means wait; do not
+   crowd the box.
+5. Stage the export (shape-only preflight):
+
+       infra/profiler/window.sh --window c \
+         --csv <path-to-export> push
+
+   → `export matches the 38-column contract` and `export in quarantine as export.csv`.
+6. `infra/profiler/window.sh --window c run` → `C completed; runtime torn down`. A code
+   (`E_POD`, `E_DATABASE_START`, `E_DATABASE_READY`, `E_STORAGE`, `E_WORKER`, `E_C_RUN`)
+   means: go to step 11, clean, and stop.
+7. `infra/profiler/window.sh --window c verify` → `C report matches the frozen numeric schema`.
+8. **Box**, read the whole report: `ssh hpc 'less <data-dir>/recall-quarantine/eval_real.json'`.
+   It has fixed keys and numbers only. Any text that is not a key name means stop: go to step 11.
+9. `infra/profiler/window.sh --window c fetch` → answer `y` only after step 8 →
+   `eval_real.json -> staged sealed report; run release next`.
+10. `infra/profiler/window.sh --window c release` → `C aggregate released; …`.
+11. `infra/profiler/window.sh --window c clean` → `C cleanup verified; …`.
+12. **Box**, check the leftovers:
+
+        ssh hpc 'ls -la <data-dir>/recall-quarantine'
+        ssh hpc podman pod ps -q \
+          --filter label=recall.window=c
+        ssh hpc podman ps -aq \
+          --filter label=recall.window=c
+
+    → no `export.csv`, `eval_real.json`, `window_c.log` or `*.tmp`; both podman lines empty.
+13. `make check-clean` on the workstation, **unsandboxed** → quarantine empty.
+14. 🔓 `tools/guard/airlock close`. Only now resume AI-assisted work; the released aggregate
+    is in `local/released/`.
+
 C fetch copies **only** `eval_real.json` into workstation sealed staging obtained from
 `sealed_path`, never into `local/artifacts`. `--yes` cannot approve C's review gate.
 Local exact-schema validation precedes the unchanged aggregate exporter; failed validation
